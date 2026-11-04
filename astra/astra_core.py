@@ -351,8 +351,7 @@ def fetch_ats(
                 a = age_hours(row.get("posted_at"))
                 if a is None:
                     continue
-                margin = 8 if row.get("date_kind") == "relative_posted" else 1
-                if a <= hours_old + margin:
+                if a <= hours_old + 1:
                     rows.append(row)
         except Exception as exc:
             errors.append(f"{company} ({ats}): {exc}")
