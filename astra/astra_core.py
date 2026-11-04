@@ -113,8 +113,7 @@ def salary_text(row: dict[str, Any]) -> str:
 
 
 def dedupe_key(row: dict[str, Any]) -> str:
-    title = re.sub(r"\b(sr|senior|jr|junior|ii|iii|lead)\b", "", _ascii(row.get("title")))
-    title = re.sub(r"[^a-z0-9]+", " ", title)
+    title = re.sub(r"[^a-z0-9]+", " ", _ascii(row.get("title")))
     company = re.sub(r"[^a-z0-9]+", " ", _ascii(row.get("company")))
     city = _ascii(row.get("city") or city_bucket(row.get("location")))
     raw = f"{company}|{title.strip()}|{city}"
