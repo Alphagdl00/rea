@@ -1,1 +1,4 @@
-.venv/\ndata/\n__pycache__/\n*.pyc\n
+.venv/
+data/
+__pycache__/
+*.pyc
