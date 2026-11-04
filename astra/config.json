@@ -1,0 +1,12 @@
+{
+  "finance_queries": [
+    "finance",
+    "financial",
+    "FP&A",
+    "controller",
+    "treasury",
+    "accounting manager"
+  ],
+  "default_cities": ["Guadalajara", "Monterrey", "CDMX"],
+  "default_hours": 48
+}
