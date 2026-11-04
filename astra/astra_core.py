@@ -25,8 +25,8 @@ FINANCE_TITLE_TERMS = (
 )
 FINANCE_FUNCTION_TERMS = ("finance", "accounting", "audit", "treasury", "financial")
 CITY_ALIASES = {
-    "Guadalajara": ["guadalajara", "zapopan", "tlaquepaque", "tlajomulco", "el salto", "jalisco"],
-    "Monterrey": ["monterrey", "san pedro garza garcia", "san pedro garza garcía", "apodaca", "santa catarina", "escobedo", "nuevo leon", "nuevo león"],
+    "Guadalajara": ["guadalajara", "zapopan", "tlaquepaque", "tlajomulco", "el salto"],
+    "Monterrey": ["monterrey", "san pedro garza garcia", "san pedro garza garcía", "apodaca", "santa catarina", "escobedo"],
     "CDMX": ["ciudad de mexico", "ciudad de méxico", "mexico city", "méxico city", "cdmx", "distrito federal", "santa fe", "polanco", "miguel hidalgo", "cuajimalpa", "azcapotzalco"],
 }
 SOURCE_PRIORITY = {"workday": 0, "greenhouse": 0, "lever": 0, "ashby": 0, "linkedin": 1, "indeed": 2, "glassdoor": 3}
