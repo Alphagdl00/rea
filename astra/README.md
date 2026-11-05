@@ -1,4 +1,4 @@
-# Astra Finance Radar v3.3
+# Astra Finance Radar v3.4
 
 Radar local de vacantes financieras para **todo México** o para Guadalajara, Monterrey y CDMX, centrado en publicaciones de las últimas **24 o 48 horas**.
 
@@ -169,3 +169,22 @@ Settings live in `config.json`:
   "linkedin_enrichment_delay_seconds": 3.0
 }
 ```
+
+
+## LinkedIn detail diagnostics v3.4
+
+The LinkedIn detail enrichment now uses the same request headers/session behavior as JobSpy, but Astra controls the HTTP response itself instead of relying on JobSpy's internal method that can swallow detail-page failures.
+
+After each run Astra displays a visible summary such as:
+
+```
+LinkedIn detalle resumen: 6/8 enriquecidas; 2 con salario
+```
+
+If LinkedIn returns HTTP 403/429, enrichment stops immediately and the UI reports it. This makes it possible to distinguish:
+
+- detail page reached, no salary published;
+- detail page enriched successfully;
+- LinkedIn blocked the detail pass.
+
+The salary parser also supports single monthly values such as `$70,000/mo`, not only salary ranges.
