@@ -28,15 +28,16 @@ config = load_config()
 init_db(DB_PATH)
 
 st.title("Astra Finance Radar")
-st.caption("LinkedIn + ATS corporativos · Finanzas · Guadalajara / Monterrey / CDMX · 24–48 horas")
+st.caption("LinkedIn + ATS + OCC · Finanzas · México · 24–48 horas")
 
 with st.sidebar:
     st.header("Búsqueda")
-    cities = st.multiselect("Ciudades", ["Guadalajara", "Monterrey", "CDMX"], default=["Guadalajara", "Monterrey", "CDMX"])
+    cities = st.multiselect("Ubicación", ["Todo México", "Guadalajara", "Monterrey", "CDMX"], default=["Guadalajara", "Monterrey", "CDMX"])
     window = st.radio("Antigüedad máxima", [24, 48], index=1, format_func=lambda x: f"{x} horas")
     st.subheader("Fuentes")
     use_linkedin = st.checkbox("LinkedIn", value=True)
     use_ats = st.checkbox("ATS corporativos", value=True)
+    use_occ = st.checkbox("OCC", value=True)
     use_indeed = st.checkbox("Indeed", value=False)
     use_glassdoor = st.checkbox("Glassdoor", value=False)
     results_wanted = st.slider("Resultados por consulta/fuente", min_value=20, max_value=100, value=50, step=10)
@@ -44,6 +45,7 @@ with st.sidebar:
     seniority_default = ["Executive", "Senior", "Manager"]
     minimum_score = st.slider("Score Astra mínimo", min_value=0, max_value=100, value=50, step=5)
     only_priority = st.checkbox("Solo empresas objetivo", value=False)
+    only_salary = st.checkbox("Solo con salario detectado", value=False)
     search_now = st.button("Buscar ahora", type="primary", use_container_width=True)
     st.caption("No requiere iniciar sesión en LinkedIn. Si LinkedIn limita peticiones, Astra conserva ATS y muestra el error sin inventar resultados.")
 
@@ -52,10 +54,15 @@ if use_linkedin:
     sources.append("linkedin")
 if use_ats:
     sources.append("ats")
+if use_occ:
+    sources.append("occ")
 if use_indeed:
     sources.append("indeed")
 if use_glassdoor:
     sources.append("glassdoor")
+
+if "Todo México" in cities:
+    cities = ["Todo México"]
 
 if search_now:
     if not cities:
@@ -97,13 +104,17 @@ if not jobs:
 
 raw = pd.DataFrame(jobs)
 
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("Vacantes únicas", len(raw))
 recent_count = int(raw["freshness"].isin(["HOY (sin hora)", "HOT 0–24h"]).sum())
 c2.metric("Hoy / ≤24h", recent_count)
 c3.metric("Manager+", int(raw["seniority"].isin(["Executive", "Senior", "Manager"]).sum()))
-c4.metric("ATS presentes", int(raw["sources"].str.contains("workday|greenhouse|lever|ashby|smartrecruiters", case=False, na=False).sum()))
-c5.metric("LinkedIn", "PARCIAL" if linkedin_partial else int(raw["sources"].str.contains("linkedin", case=False, na=False).sum()))
+c4.metric("Con salario", int(raw["salary"].fillna("").astype(str).str.len().gt(0).sum()))
+c5.metric("OCC", int(raw["sources"].str.contains("occ", case=False, na=False).sum()))
+c6.metric("LinkedIn", "PARCIAL" if linkedin_partial else int(raw["sources"].str.contains("linkedin", case=False, na=False).sum()))
+
+ats_count = int(raw["sources"].str.contains("workday|greenhouse|lever|ashby|smartrecruiters", case=False, na=False).sum())
+st.caption(f"ATS directos presentes en esta corrida: {ats_count}")
 
 st.subheader("Resultados priorizados")
 f1, f2, f3, f4 = st.columns([2, 1, 1, 1])
@@ -123,6 +134,8 @@ if seniority_filter:
     df = df[df["seniority"].isin(seniority_filter)]
 if only_priority:
     df = df[df["priority_company"] == True]
+if only_salary:
+    df = df[df["salary"].fillna("").astype(str).str.len() > 0]
 if text_filter:
     needle = text_filter.lower()
     df = df[df.apply(lambda r: needle in str(r.get("title", "")).lower() or needle in str(r.get("company", "")).lower(), axis=1)]
@@ -169,7 +182,7 @@ df = df.sort_values(["astra_score", "sort_age"], ascending=[False, True])
 df["Objetivo"] = df["priority_company"].apply(lambda x: "★" if bool(x) else "")
 view_cols = [
     "astra_score", "seniority", "Objetivo", "freshness", "Edad", "title", "company", "city", "location", "sources",
-    "Publicado / actualizado", "Fecha fuente", "salary", "direct_url", "linkedin_url", "score_reason",
+    "Publicado / actualizado", "Fecha fuente", "salary", "salary_source", "direct_url", "linkedin_url", "score_reason",
 ]
 view = df[[c for c in view_cols if c in df.columns]].rename(columns={
     "astra_score": "Score",
@@ -181,6 +194,7 @@ view = df[[c for c in view_cols if c in df.columns]].rename(columns={
     "location": "Ubicación",
     "sources": "Fuentes",
     "salary": "Salario",
+    "salary_source": "Fuente salario",
     "direct_url": "Aplicar",
     "linkedin_url": "LinkedIn",
     "score_reason": "Razón score",
@@ -201,6 +215,9 @@ csv_bytes = view.to_csv(index=False).encode("utf-8-sig")
 st.download_button("Descargar resultados CSV", csv_bytes, file_name="astra_finance_jobs.csv", mime="text/csv")
 
 st.divider()
+st.subheader("Salarios")
+st.caption("Astra usa primero el salario estructurado de la fuente. Si no existe, intenta detectar rangos dentro de la descripción del puesto. La columna Fuente salario distingue ambos casos; una cifra detectada nunca se presenta como estimación de mercado.")
+
 st.subheader("Cómo leer el Score Astra")
 st.caption("El score prioriza seniority, empresa objetivo, fuente ATS directa, frescura y señales como salario publicado. No elimina vacantes: el filtro por defecto muestra Executive/Senior/Manager y puedes abrir IC/Other cuando quieras.")
 
