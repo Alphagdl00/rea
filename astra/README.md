@@ -1,11 +1,13 @@
-# Astra Finance Radar v3
+# Astra Finance Radar v3.1
 
-Radar local de vacantes financieras para **Guadalajara, Monterrey y CDMX**, centrado en publicaciones de las últimas **24 o 48 horas**.
+Radar local de vacantes financieras para **todo México** o para Guadalajara, Monterrey y CDMX, centrado en publicaciones de las últimas **24 o 48 horas**.
 
 ## Qué hace esta versión
 
 - Busca LinkedIn mediante `python-jobspy`, sin iniciar sesión con tu cuenta personal.
 - Consulta ATS corporativos directamente: **Workday, Greenhouse, Lever, Ashby y SmartRecruiters**.
+- Consulta **OCC** mediante sus páginas públicas server-rendered, sin iniciar sesión.
+- Permite buscar **Todo México** y clasifica resultados por región/estado cuando la ubicación lo permite.
 - Busca un universo amplio de Finanzas: Finance, Financial, FP&A, Controller, Treasury y Accounting Manager, y después filtra localmente títulos/funciones financieras.
 - Deduplica LinkedIn vs ATS por empresa + puesto + ciudad.
 - Clasifica automáticamente el seniority: **Executive / Senior / Manager / Other / IC**.
@@ -15,6 +17,8 @@ Radar local de vacantes financieras para **Guadalajara, Monterrey y CDMX**, cent
 - Cuando la misma vacante existe en LinkedIn y en un ATS, prioriza el **enlace corporativo directo** y conserva el enlace de LinkedIn.
 - Separa **HOT 0–24h** y **FRESH 24–48h**.
 - Muestra salario cuando la fuente lo publica.
+- Si no hay salario estructurado, intenta extraer **rangos salariales dentro de la descripción** y marca la fuente del dato.
+- Para Workday y SmartRecruiters consulta el detalle solo de vacantes financieras recientes para enriquecer descripción/salario.
 - Guarda cada ejecución en SQLite (`data/astra_jobs.db`) y permite exportar CSV.
 - Nunca convierte una fecha de actualización de Greenhouse en una supuesta fecha de publicación: la etiqueta como **Actualización**.
 
@@ -32,6 +36,10 @@ Requiere Python 3.10 o superior. **No requiere ejecutar como Administrador.**
 ### LinkedIn
 
 Astra usa JobSpy. `hours_old` se envía a la búsqueda para limitar los resultados a 24/48 horas. LinkedIn puede responder con HTTP 429 si se hacen demasiadas consultas; Astra muestra el error y continúa con los ATS, en vez de fabricar resultados.
+
+### OCC
+
+OCC se consulta como bolsa nacional por palabras clave. Astra usa páginas públicas de búsqueda y, cuando la tarjeta no trae fecha o salario, consulta el detalle solo de la vacante financiera candidata. La integración no usa cuenta ni sesión. Si OCC presenta un challenge o cambia el markup, Astra muestra el aviso en lugar de fingir una búsqueda vacía.
 
 ### ATS
 
@@ -57,6 +65,7 @@ Esta versión amplía las fuentes ATS verificadas a Authentic Brands Group, Take
 | SmartRecruiters | `releasedDate` | Publicación |
 | Workday | `postedOn` | Publicación relativa |
 | Greenhouse | `updated_at` | Actualización |
+| OCC | tarjeta pública + `datePosted` del detalle cuando está disponible | Publicación |
 
 Greenhouse no proporciona de forma consistente una fecha original de publicación en su endpoint público. Por eso Astra no la presenta como tal.
 
@@ -68,6 +77,7 @@ Greenhouse no proporciona de forma consistente una fecha original de publicació
 - `target_companies.csv`: universo de empresas objetivo para scoring.
 - `config.json`: términos de búsqueda.
 - `run_astra.bat`: arranque de un clic en Windows.
+- `THIRD_PARTY_NOTICES.md`: atribución MIT del diseño del parser OCC.
 
 ## Nota de uso responsable
 
@@ -88,3 +98,20 @@ El score no reemplaza el juicio humano. Sirve para ordenar el ruido:
 ## Corrección de Workday v3
 
 Algunos tenants Workday devuelven `total=0` aunque sí regresen páginas de vacantes. Astra ya no corta la paginación por ese valor: continúa mientras reciba páginas completas, hasta llegar al final o al límite de seguridad.
+
+
+## Salarios en v3.1
+
+Astra diferencia el origen del dato:
+
+- **estructurado**: la fuente entrega mínimo/máximo/moneda de forma explícita.
+- **OCC**: rango visible en la tarjeta o detalle de OCC.
+- **descripción**: rango detectado dentro del texto del anuncio.
+
+El extractor busca expresiones explícitas como sueldo, salario, compensation, salary o pay range y requiere cifras monetarias. No convierte beneficios como aguinaldo, prima vacacional o días de descanso en salario.
+
+Para proteger la cobertura de LinkedIn frente a 429, Astra **no abre automáticamente la descripción de cada vacante de LinkedIn**. Si LinkedIn entrega salario estructurado, se conserva; la detección en texto se concentra en ATS y OCC, donde podemos hacerlo con menos presión de requests.
+
+## Todo México
+
+Selecciona **Todo México** en Ubicación. Esa opción reemplaza las ciudades individuales durante la corrida. LinkedIn/Indeed/Glassdoor buscan a nivel país, los ATS aceptan cualquier ubicación mexicana y OCC omite el filtro estatal. La tabla conserva la ubicación original y clasifica la región cuando es posible.
