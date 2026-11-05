@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
-USER_AGENT = "AstraFinanceRadar/2.1 (+local job-search tool)"
+USER_AGENT = "AstraFinanceRadar/3.0 (+local job-search tool)"
 MX_TZ = ZoneInfo("America/Mexico_City")
 FINANCE_TITLE_TERMS = (
     "finance", "financial", "fp&a", "fp & a", "financial planning", "controller",
@@ -31,7 +31,7 @@ CITY_ALIASES = {
     "Monterrey": ["monterrey", "san pedro garza garcia", "san pedro garza garcía", "apodaca", "santa catarina", "escobedo"],
     "CDMX": ["ciudad de mexico", "ciudad de méxico", "mexico city", "méxico city", "cdmx", "distrito federal"],
 }
-SOURCE_PRIORITY = {"workday": 0, "greenhouse": 0, "lever": 0, "ashby": 0, "linkedin": 1, "indeed": 2, "glassdoor": 3}
+SOURCE_PRIORITY = {"workday": 0, "greenhouse": 0, "lever": 0, "ashby": 0, "smartrecruiters": 0, "linkedin": 1, "indeed": 2, "glassdoor": 3}
 
 
 def utcnow() -> datetime:
@@ -121,6 +121,106 @@ def local_days_ago(value: Any) -> int | None:
     if not dt:
         return None
     return (datetime.now(MX_TZ).date() - dt.astimezone(MX_TZ).date()).days
+
+
+def normalize_company_name(value: Any) -> str:
+    s = _ascii(value).replace("&", " and ")
+    s = re.sub(r"\b(inc|incorporated|corp|corporation|company|co|llc|ltd|plc|group)\b", " ", s)
+    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+
+def load_target_companies(path: str | Path | None) -> set[str]:
+    if not path:
+        return set()
+    p = Path(path)
+    if not p.exists():
+        return set()
+    with p.open("r", encoding="utf-8-sig", newline="") as f:
+        rows = csv.DictReader(f)
+        return {normalize_company_name(r.get("company")) for r in rows if r.get("company")}
+
+
+def company_is_target(company: Any, targets: set[str]) -> bool:
+    n = normalize_company_name(company)
+    if not n:
+        return False
+    if n in targets:
+        return True
+    return any(len(t) >= 5 and (n in t or t in n) for t in targets)
+
+
+def classify_seniority(title: Any) -> str:
+    t = _ascii(title)
+    if any(x in t for x in ("intern", "internship", "trainee", "becario", "practicante")):
+        return "IC"
+    if any(x in t for x in (
+        "chief financial officer", " cfo", "cfo ", "vice president", "vp finance", "vp, finance",
+        "head of finance", "finance director", "director of finance", "financial director",
+        "director finance", "director, finance", "director financiero", "direccion de administracion y finanzas",
+    )):
+        return "Executive"
+    if any(x in t for x in (
+        "senior finance manager", "sr finance manager", "sr. finance manager",
+        "senior fp&a manager", "sr fp&a manager", "senior financial planning manager",
+        "finance business partner lead", "lead finance business partner",
+        "finance lead", "financial controller", "corporate controller",
+    )):
+        return "Senior"
+    if any(x in t for x in (
+        "finance manager", "financial manager", "fp&a manager", "financial planning manager",
+        "accounting manager", "treasury manager", "commercial finance manager",
+        "plant controller", "controller", "contralor", "finance business partner",
+        "controlling manager", "head of controlling",
+    )):
+        return "Manager"
+    if any(x in t for x in (
+        "analyst", "analista", "specialist", "especialista", "accountant", "contador",
+        "coordinator", "coordinador", "assistant", "auxiliar", "clerk", "associate",
+    )):
+        return "IC"
+    if "director" in t or "head " in t:
+        return "Executive"
+    if "senior manager" in t or "sr manager" in t or "lead " in t:
+        return "Senior"
+    if "manager" in t:
+        return "Manager"
+    return "Other"
+
+
+def astra_score(row: dict[str, Any], targets: set[str]) -> tuple[int, str]:
+    seniority = row.get("seniority") or classify_seniority(row.get("title"))
+    base = {"Executive": 80, "Senior": 70, "Manager": 60, "Other": 42, "IC": 24}.get(seniority, 40)
+    score = base
+    reasons = [seniority]
+
+    title = _ascii(row.get("title"))
+    if any(x in title for x in ("cfo", "chief financial officer", "vice president", "head of finance")):
+        score += 8; reasons.append("liderazgo ejecutivo")
+    elif "director" in title:
+        score += 6; reasons.append("dirección")
+    elif any(x in title for x in ("senior finance manager", "sr finance manager", "plant controller", "corporate controller")):
+        score += 5; reasons.append("rol objetivo")
+
+    if company_is_target(row.get("company"), targets):
+        score += 8; reasons.append("empresa objetivo")
+
+    sources = _ascii(row.get("sources") or row.get("source"))
+    if any(x in sources for x in ("workday", "greenhouse", "lever", "ashby", "smartrecruiters")):
+        score += 5; reasons.append("ATS directo")
+    if "," in str(row.get("sources") or ""):
+        score += 2; reasons.append("multi-fuente")
+    if row.get("salary"):
+        score += 2; reasons.append("salario publicado")
+
+    if row.get("freshness") in ("HOY (sin hora)", "HOT 0–24h"):
+        score += 5; reasons.append("reciente")
+    elif row.get("freshness") in ("AYER (sin hora)", "FRESH 24–48h"):
+        score += 2
+
+    if any(x in title for x in ("intern", "trainee", "assistant", "auxiliar", "clerk")):
+        score -= 18; reasons.append("nivel junior")
+
+    return max(0, min(100, int(score))), " · ".join(reasons)
 
 
 def salary_text(row: dict[str, Any]) -> str:
@@ -295,6 +395,37 @@ def fetch_ashby(company: str, board: str) -> list[dict[str, Any]]:
     return out
 
 
+def fetch_smartrecruiters(company: str, board: str, max_results: int = 500) -> list[dict[str, Any]]:
+    session = _requests_session()
+    out: list[dict[str, Any]] = []
+    offset = 0
+    limit = 100
+    while offset < max_results:
+        url = f"https://api.smartrecruiters.com/v1/companies/{board.strip('/')}/postings"
+        r = session.get(url, params={"limit": limit, "offset": offset}, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        posts = data.get("content", [])
+        for j in posts:
+            loc = j.get("location") or {}
+            location = ", ".join(str(x) for x in [loc.get("city"), loc.get("region"), loc.get("country")] if x)
+            posting_id = str(j.get("id") or j.get("uuid") or "")
+            posting_url = f"https://jobs.smartrecruiters.com/{board.strip('/')}/{posting_id}"
+            out.append(_row_base(
+                id=posting_id, source="smartrecruiters", title=j.get("name") or "", company=company,
+                location=location, posted_at=parse_dt(j.get("releasedDate")), date_kind="published_at",
+                posted_label=str(j.get("releasedDate") or ""), job_url=posting_url, direct_url=posting_url,
+                description="", job_type=(j.get("typeOfEmployment") or {}).get("label") or "",
+                job_level=(j.get("experienceLevel") or {}).get("label") or "",
+                job_function=(j.get("function") or {}).get("label") or "",
+            ))
+        offset += len(posts)
+        total = int(data.get("totalFound") or 0)
+        if not posts or len(posts) < limit or (total > 0 and offset >= total):
+            break
+    return out
+
+
 def _workday_parts(board: str) -> tuple[str, str]:
     u = urlparse(board)
     if not u.scheme:
@@ -357,7 +488,7 @@ def fetch_workday(company: str, board: str, max_results: int = 250) -> list[dict
             ))
         offset += len(posts)
         total = int(data.get("total") or 0)
-        if not posts or offset >= total:
+        if not posts or len(posts) < limit or (total > 0 and offset >= total):
             break
     return out
 
@@ -379,6 +510,7 @@ def fetch_ats(
             elif ats == "lever": found = fetch_lever(company, board)
             elif ats == "ashby": found = fetch_ashby(company, board)
             elif ats == "workday": found = fetch_workday(company, board)
+            elif ats == "smartrecruiters": found = fetch_smartrecruiters(company, board)
             else:
                 errors.append(f"{company}: ATS no soportado '{ats}'")
                 continue
@@ -409,7 +541,7 @@ def merge_dedupe(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         best = dict(items[0])
         best["sources"] = ", ".join(dict.fromkeys(str(i.get("source")) for i in items if i.get("source")))
         best["linkedin_url"] = next((str(i.get("job_url")) for i in items if i.get("source") == "linkedin" and i.get("job_url")), "")
-        best["direct_url"] = next((str(i.get("direct_url")) for i in items if i.get("source") in {"workday", "greenhouse", "lever", "ashby"} and i.get("direct_url")), best.get("direct_url") or best.get("job_url") or "")
+        best["direct_url"] = next((str(i.get("direct_url")) for i in items if i.get("source") in {"workday", "greenhouse", "lever", "ashby", "smartrecruiters"} and i.get("direct_url")), best.get("direct_url") or best.get("job_url") or "")
         dts = [parse_dt(i.get("posted_at")) for i in items if parse_dt(i.get("posted_at"))]
         if dts:
             best["posted_at"] = max(dts)
@@ -430,6 +562,18 @@ def merge_dedupe(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         merged.append(best)
     merged.sort(key=lambda r: (r.get("sort_age", 999999), str(r.get("company"))))
     return merged
+
+
+def enrich_ranking(rows: list[dict[str, Any]], target_companies_path: str | Path | None = None) -> list[dict[str, Any]]:
+    targets = load_target_companies(target_companies_path)
+    for row in rows:
+        row["seniority"] = classify_seniority(row.get("title"))
+        row["priority_company"] = company_is_target(row.get("company"), targets)
+        score, reason = astra_score(row, targets)
+        row["astra_score"] = score
+        row["score_reason"] = reason
+    rows.sort(key=lambda r: (-int(r.get("astra_score") or 0), r.get("sort_age", 999999), str(r.get("company"))))
+    return rows
 
 
 def init_db(path: str | Path) -> None:
@@ -471,7 +615,8 @@ def upsert_jobs(path: str | Path, rows: list[dict[str, Any]]) -> None:
 
 
 def run_search(config: dict[str, Any], cities: list[str], hours_old: int, sources: list[str], results_wanted: int,
-               ats_csv: str | Path, progress: Callable[[str], None] | None = None) -> tuple[list[dict[str, Any]], list[str]]:
+               ats_csv: str | Path, progress: Callable[[str], None] | None = None,
+               target_companies_path: str | Path | None = None) -> tuple[list[dict[str, Any]], list[str]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
     board_sites = [s for s in sources if s in {"linkedin", "indeed", "glassdoor"}]
@@ -481,4 +626,5 @@ def run_search(config: dict[str, Any], cities: list[str], hours_old: int, source
     if "ats" in sources:
         r, e = fetch_ats(load_ats_sources(ats_csv), hours_old, cities, progress)
         rows.extend(r); errors.extend(e)
-    return merge_dedupe(rows), list(dict.fromkeys(errors))
+    merged = merge_dedupe(rows)
+    return enrich_ranking(merged, target_companies_path), list(dict.fromkeys(errors))
