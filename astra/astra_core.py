@@ -292,6 +292,99 @@ def salary_text(row: dict[str, Any]) -> str:
     return " ".join(x for x in [cur, amount, str(interval)] if x)
 
 
+def _parse_salary_amount(value: str) -> float | None:
+    raw = re.sub(r"[^0-9.,]", "", value or "")
+    if not raw:
+        return None
+    if "," in raw and "." in raw:
+        raw = raw.replace(",", "")
+    elif raw.count(",") >= 1:
+        parts = raw.split(",")
+        raw = "".join(parts) if all(len(p) == 3 for p in parts[1:]) else raw.replace(",", ".")
+    elif raw.count(".") == 1 and len(raw.split(".")[-1]) == 3:
+        raw = raw.replace(".", "")
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def extract_salary_from_text(text: Any, strict: bool = True) -> dict[str, Any] | None:
+    plain = clean_html(text)
+    if not plain:
+        return None
+
+    number = r"(\d{1,3}(?:[ ,.]\d{3})+|\d{4,7})"
+    currency = r"(MXN|USD|US\$|MEX\$|\$)"
+    interval = r"(mensual(?:es)?|mes|monthly|month|anual(?:es)?|annual|yearly|hora|hourly|hour)"
+
+    labelled = re.compile(
+        rf"(?is)(sueldo|salario|salary|compensaci[oó]n|compensation|rango salarial|pay range|base pay)"
+        rf"[^\n.;]{{0,90}}?(?:{currency}\s*)?\$?\s*{number}"
+        rf"(?:\s*(?:-|–|—|a|to)\s*(?:{currency}\s*)?\$?\s*{number})?"
+        rf"[^\n.;]{{0,35}}?(?:{interval})?"
+    )
+    direct = re.compile(
+        rf"(?is)(?:{currency}\s*)?\$?\s*{number}\s*(?:-|–|—|a|to)\s*"
+        rf"(?:{currency}\s*)?\$?\s*{number}[^\n.;]{{0,35}}?(?:{interval})"
+    )
+
+    match = labelled.search(plain) or direct.search(plain)
+    if not match and not strict:
+        single = re.compile(
+            rf"(?is)(?:{currency}\s*)?\$?\s*{number}[^\n.;]{{0,25}}?(?:{interval})"
+        )
+        match = single.search(plain)
+    if not match:
+        return None
+
+    raw = match.group(0).strip()
+    nums = re.findall(number, raw)
+    amounts = [_parse_salary_amount(x) for x in nums[:2]]
+    amounts = [x for x in amounts if x is not None]
+    if not amounts:
+        return None
+
+    cur = "MXN"
+    if re.search(r"(?i)USD|US\$", raw):
+        cur = "USD"
+    elif re.search(r"(?i)MXN|MEX\$", raw):
+        cur = "MXN"
+
+    interval_match = re.search(interval, raw, flags=re.I)
+    period = ""
+    if interval_match:
+        p = _ascii(interval_match.group(0))
+        if p in {"mensual", "mensuales", "mes", "monthly", "month"}:
+            period = "mensual"
+        elif p in {"anual", "anuales", "annual", "yearly"}:
+            period = "anual"
+        elif p in {"hora", "hourly", "hour"}:
+            period = "hora"
+
+    return {
+        "min_amount": min(amounts),
+        "max_amount": max(amounts) if len(amounts) > 1 else min(amounts),
+        "currency": cur,
+        "interval": period,
+        "raw": raw,
+    }
+
+
+def apply_salary_extraction(row: dict[str, Any], source_label: str = "descripción") -> dict[str, Any]:
+    if row.get("salary"):
+        row["salary_source"] = row.get("salary_source") or "estructurado"
+        return row
+    hit = extract_salary_from_text(row.get("description"), strict=True)
+    if not hit:
+        return row
+    row.update({k: hit[k] for k in ("min_amount", "max_amount", "currency", "interval")})
+    row["salary"] = salary_text(row)
+    row["salary_source"] = source_label
+    row["salary_raw"] = hit["raw"]
+    return row
+
+
 def dedupe_key(row: dict[str, Any]) -> str:
     title = re.sub(r"[^a-z0-9]+", " ", _ascii(row.get("title")))
     company = re.sub(r"[^a-z0-9]+", " ", _ascii(row.get("company")))
@@ -306,10 +399,14 @@ def _row_base(**kwargs: Any) -> dict[str, Any]:
         "posted_at": None, "date_kind": "unknown", "posted_label": "", "job_url": "", "direct_url": "",
         "description": "", "job_type": "", "job_level": "", "job_function": "", "min_amount": None,
         "max_amount": None, "currency": "", "interval": "", "is_remote": False, "salary": "",
+        "salary_source": "", "salary_raw": "",
     }
     row.update(kwargs)
     row["city"] = row.get("city") or city_bucket(row.get("location"))
     row["salary"] = row.get("salary") or salary_text(row)
+    if row["salary"] and not row.get("salary_source"):
+        row["salary_source"] = "estructurado"
+    row = apply_salary_extraction(row)
     row["dedupe_key"] = dedupe_key(row)
     return row
 
