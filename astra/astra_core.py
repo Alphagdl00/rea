@@ -316,7 +316,7 @@ def compensation_fit(
         return 0, "Sin ajuste", monthly, floor if floor > 0 else None
 
     ratio = monthly / floor
-    if ratio < 0.50:
+    if ratio <= 0.50:
         return -40, f"Muy bajo ({ratio:.0%} del piso)", monthly, floor
     if ratio < 0.70:
         return -30, f"Alto descuento ({ratio:.0%} del piso)", monthly, floor
