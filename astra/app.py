@@ -99,9 +99,13 @@ jobs = st.session_state.get("jobs", [])
 errors = st.session_state.get("errors", [])
 
 linkedin_partial = any("linkedin" in e.lower() and "429" in e.lower() for e in errors)
+linkedin_detail_summary = next((e for e in errors if e.startswith("LinkedIn detalle resumen:")), "")
 
 if linkedin_partial:
     st.error("Cobertura LinkedIn: PARCIAL. LinkedIn limitó peticiones (429). Los resultados mostrados son reales, pero esta corrida puede estar incompleta.")
+
+if linkedin_detail_summary:
+    st.info(linkedin_detail_summary)
 
 if errors:
     with st.expander(f"Avisos de fuentes ({len(errors)})", expanded=linkedin_partial):
