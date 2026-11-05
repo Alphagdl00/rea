@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
-USER_AGENT = "AstraFinanceRadar/3.0 (+local job-search tool)"
+USER_AGENT = "AstraFinanceRadar/3.1 (+local job-search tool)"
 MX_TZ = ZoneInfo("America/Mexico_City")
 FINANCE_TITLE_TERMS = (
     "finance", "financial", "fp&a", "fp & a", "financial planning", "controller",
@@ -31,7 +31,45 @@ CITY_ALIASES = {
     "Monterrey": ["monterrey", "san pedro garza garcia", "san pedro garza garcía", "apodaca", "santa catarina", "escobedo"],
     "CDMX": ["ciudad de mexico", "ciudad de méxico", "mexico city", "méxico city", "cdmx", "distrito federal"],
 }
-SOURCE_PRIORITY = {"workday": 0, "greenhouse": 0, "lever": 0, "ashby": 0, "smartrecruiters": 0, "linkedin": 1, "indeed": 2, "glassdoor": 3}
+MEXICO_REGION_ALIASES = {
+    "Aguascalientes": ["aguascalientes"],
+    "Baja California": ["baja california", "tijuana", "mexicali", "ensenada"],
+    "Baja California Sur": ["baja california sur", "la paz", "los cabos"],
+    "Campeche": ["campeche"],
+    "Chiapas": ["chiapas", "tuxtla gutierrez", "tuxtla gutiérrez"],
+    "Chihuahua": ["chihuahua", "ciudad juarez", "ciudad juárez"],
+    "Coahuila": ["coahuila", "saltillo", "torreon", "torreón"],
+    "Colima": ["colima", "manzanillo"],
+    "Durango": ["durango"],
+    "Estado de México": ["estado de mexico", "estado de méxico", "toluca", "naucalpan", "tlalnepantla"],
+    "Guanajuato": ["guanajuato", "leon", "león", "silao", "irapuato", "celaya"],
+    "Guerrero": ["guerrero", "acapulco"],
+    "Hidalgo": ["hidalgo", "pachuca"],
+    "Jalisco": ["jalisco", "guadalajara", "zapopan", "tlaquepaque", "tlajomulco", "el salto"],
+    "Michoacán": ["michoacan", "michoacán", "morelia"],
+    "Morelos": ["morelos", "cuernavaca"],
+    "Nayarit": ["nayarit", "tepic"],
+    "Nuevo León": ["nuevo leon", "nuevo león", "monterrey", "apodaca", "san pedro garza garcia", "san pedro garza garcía", "santa catarina", "escobedo"],
+    "Oaxaca": ["oaxaca"],
+    "Puebla": ["puebla"],
+    "Querétaro": ["queretaro", "querétaro", "el marques", "el marqués"],
+    "Quintana Roo": ["quintana roo", "cancun", "cancún", "playa del carmen"],
+    "San Luis Potosí": ["san luis potosi", "san luis potosí"],
+    "Sinaloa": ["sinaloa", "culiacan", "culiacán", "mazatlan", "mazatlán"],
+    "Sonora": ["sonora", "hermosillo", "nogales"],
+    "Tabasco": ["tabasco", "villahermosa"],
+    "Tamaulipas": ["tamaulipas", "reynosa", "matamoros", "nuevo laredo"],
+    "Tlaxcala": ["tlaxcala"],
+    "Veracruz": ["veracruz", "xalapa", "poza rica"],
+    "Yucatán": ["yucatan", "yucatán", "merida", "mérida"],
+    "Zacatecas": ["zacatecas"],
+}
+OCC_STATE_SLUGS = {
+    "Guadalajara": "jalisco",
+    "Monterrey": "nuevo-leon",
+    "CDMX": "ciudad-de-mexico",
+}
+SOURCE_PRIORITY = {"workday": 0, "greenhouse": 0, "lever": 0, "ashby": 0, "smartrecruiters": 0, "occ": 1, "linkedin": 1, "indeed": 2, "glassdoor": 3}
 
 
 def utcnow() -> datetime:
@@ -92,7 +130,19 @@ def city_bucket(location: Any, requested_city: str | None = None) -> str:
     for city, aliases in CITY_ALIASES.items():
         if any(_ascii(a) in loc for a in aliases):
             return city
-    return "Otra"
+    for region, aliases in MEXICO_REGION_ALIASES.items():
+        if any(_ascii(a) in loc for a in aliases):
+            return region
+    return "Otra México" if is_mexico_location(location) else "Otra"
+
+
+def is_mexico_location(location: Any) -> bool:
+    loc = _ascii(location)
+    if not loc:
+        return False
+    if "mexico" in loc or "méxico" in str(location).lower():
+        return True
+    return any(_ascii(alias) in loc for aliases in MEXICO_REGION_ALIASES.values() for alias in aliases)
 
 
 def normalize_board_date(value: Any) -> tuple[datetime | None, str, str]:
