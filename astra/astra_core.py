@@ -336,14 +336,17 @@ def apply_compensation_fit(
     for row in rows:
         base_score = int(row.get("score_base") if row.get("score_base") is not None else (row.get("astra_score") or 0))
         adjustment, label, monthly, floor = compensation_fit(row, floors)
+        reason_base = str(row.get("score_reason_base") or row.get("score_reason") or "")
+        if " · comp " in reason_base:
+            reason_base = reason_base.split(" · comp ", 1)[0]
         row["score_base"] = base_score
+        row["score_reason_base"] = reason_base
         row["comp_adjustment"] = adjustment
         row["comp_fit"] = label
         row["salary_monthly_mxn"] = monthly
         row["comp_floor_mxn"] = floor
         row["astra_score"] = max(0, min(100, base_score + adjustment))
-        if adjustment:
-            row["score_reason"] = (str(row.get("score_reason") or "") + f" · comp {adjustment:+d}").strip(" ·")
+        row["score_reason"] = reason_base + (f" · comp {adjustment:+d}" if adjustment else "")
     rows.sort(key=lambda r: (-int(r.get("astra_score") or 0), r.get("sort_age", 999999), str(r.get("company"))))
     return rows
 
