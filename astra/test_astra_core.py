@@ -4,6 +4,8 @@ from astra_core import (
     _occ_search_url,
     _parse_occ_cards,
     astra_score,
+    compensation_fit,
+    monthly_salary_mxn,
     city_bucket,
     classify_seniority,
     company_is_target,
@@ -61,6 +63,52 @@ class AstraRankingTests(unittest.TestCase):
             "salary": "",
         }
         self.assertGreater(astra_score(executive, targets)[0], astra_score(analyst, targets)[0])
+
+
+class AstraCompensationFitTests(unittest.TestCase):
+    def test_monthly_salary_normalization(self):
+        row = {
+            "min_amount": 70000,
+            "max_amount": 70000,
+            "currency": "MXN",
+            "interval": "mensual",
+        }
+        self.assertEqual(monthly_salary_mxn(row), 70000)
+
+    def test_annual_salary_normalization(self):
+        row = {
+            "min_amount": 1200000,
+            "max_amount": 1200000,
+            "currency": "MXN",
+            "interval": "anual",
+        }
+        self.assertEqual(monthly_salary_mxn(row), 100000)
+
+    def test_low_cfo_salary_gets_max_penalty(self):
+        row = {
+            "title": "CFO / Director de Finanzas",
+            "seniority": "Executive",
+            "min_amount": 70000,
+            "max_amount": 70000,
+            "currency": "MXN",
+            "interval": "mensual",
+        }
+        adjustment, label, monthly, floor = compensation_fit(
+            row, {"Executive": 140000, "Senior": 110000, "Manager": 90000}
+        )
+        self.assertEqual(monthly, 70000)
+        self.assertEqual(floor, 140000)
+        self.assertEqual(adjustment, -40)
+        self.assertIn("Muy bajo", label)
+
+    def test_missing_salary_has_no_penalty(self):
+        row = {"title": "Finance Director", "seniority": "Executive"}
+        adjustment, label, monthly, floor = compensation_fit(
+            row, {"Executive": 140000, "Senior": 110000, "Manager": 90000}
+        )
+        self.assertEqual(adjustment, 0)
+        self.assertIsNone(monthly)
+        self.assertEqual(label, "Sin ajuste")
 
 
 class AstraSalaryTests(unittest.TestCase):
