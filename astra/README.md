@@ -1,4 +1,4 @@
-# Astra Finance Radar v3.1
+# Astra Finance Radar v3.2
 
 Radar local de vacantes financieras para **todo México** o para Guadalajara, Monterrey y CDMX, centrado en publicaciones de las últimas **24 o 48 horas**.
 
@@ -115,3 +115,31 @@ Para proteger la cobertura de LinkedIn frente a 429, Astra **no abre automática
 ## Todo México
 
 Selecciona **Todo México** en Ubicación. Esa opción reemplaza las ciudades individuales durante la corrida. LinkedIn/Indeed/Glassdoor buscan a nivel país, los ATS aceptan cualquier ubicación mexicana y OCC omite el filtro estatal. La tabla conserva la ubicación original y clasifica la región cuando es posible.
+
+
+## Compensation Fit v3.2
+
+Astra no trata el seniority como sinónimo de oportunidad atractiva. Si una vacante publica compensación y puede normalizarse a MXN mensuales, el score se ajusta contra pisos editables por nivel:
+
+- Executive: 140,000 MXN/mes
+- Senior: 110,000 MXN/mes
+- Manager: 90,000 MXN/mes
+
+Los pisos iniciales son conservadores y se pueden modificar desde el panel lateral.
+
+Ajustes de score:
+
+- <= 50% del piso: -40
+- < 70% del piso: -30
+- < 85% del piso: -20
+- < 100% del piso: -10
+- >= 100% del piso: +3
+- >= 125% del piso: +6
+
+Si la vacante no publica salario, Astra no la penaliza. El objetivo es evitar que un título ejecutivo con compensación débil aparezca artificialmente arriba del ranking.
+
+La tabla muestra:
+
+- `MXN/mes`: midpoint normalizado de la compensación publicada.
+- `Fit compensación`: comparación contra el piso configurado.
+- `Δ Score`: ajuste aplicado al Score Astra.
