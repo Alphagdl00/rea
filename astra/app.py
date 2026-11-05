@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-from astra_core import init_db, run_search, upsert_jobs
+from astra_core import apply_compensation_fit, init_db, run_search, upsert_jobs
 
 BASE = Path(__file__).resolve().parent
 CONFIG_PATH = BASE / "config.json"
@@ -46,6 +46,10 @@ with st.sidebar:
     minimum_score = st.slider("Score Astra mínimo", min_value=0, max_value=100, value=50, step=5)
     only_priority = st.checkbox("Solo empresas objetivo", value=False)
     only_salary = st.checkbox("Solo con salario detectado", value=False)
+    st.subheader("Compensación")
+    executive_floor = st.number_input("Piso Executive (MXN/mes)", min_value=0, max_value=500000, value=140000, step=10000)
+    senior_floor = st.number_input("Piso Senior (MXN/mes)", min_value=0, max_value=500000, value=110000, step=10000)
+    manager_floor = st.number_input("Piso Manager (MXN/mes)", min_value=0, max_value=500000, value=90000, step=10000)
     search_now = st.button("Buscar ahora", type="primary", use_container_width=True)
     st.caption("No requiere iniciar sesión en LinkedIn. Si LinkedIn limita peticiones, Astra conserva ATS y muestra el error sin inventar resultados.")
 
@@ -76,9 +80,15 @@ if search_now:
             status.info(msg)
 
         with st.spinner("Buscando vacantes reales..."):
+            compensation_floors = {
+                "Executive": float(executive_floor),
+                "Senior": float(senior_floor),
+                "Manager": float(manager_floor),
+            }
             jobs, errors = run_search(
                 config, cities, window, sources, results_wanted, ATS_PATH, progress,
                 target_companies_path=TARGET_COMPANIES_PATH,
+                compensation_floors=compensation_floors,
             )
             upsert_jobs(DB_PATH, jobs)
             st.session_state["jobs"] = jobs
@@ -102,6 +112,12 @@ if not jobs:
     st.info("Pulsa **Buscar ahora**. La primera ejecución puede tardar más porque consulta varias combinaciones de ciudad y términos financieros.")
     st.stop()
 
+compensation_floors = {
+    "Executive": float(executive_floor),
+    "Senior": float(senior_floor),
+    "Manager": float(manager_floor),
+}
+jobs = apply_compensation_fit([dict(x) for x in jobs], compensation_floors)
 raw = pd.DataFrame(jobs)
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -182,7 +198,7 @@ df = df.sort_values(["astra_score", "sort_age"], ascending=[False, True])
 df["Objetivo"] = df["priority_company"].apply(lambda x: "★" if bool(x) else "")
 view_cols = [
     "astra_score", "seniority", "Objetivo", "freshness", "Edad", "title", "company", "city", "location", "sources",
-    "Publicado / actualizado", "Fecha fuente", "salary", "salary_source", "direct_url", "linkedin_url", "score_reason",
+    "Publicado / actualizado", "Fecha fuente", "salary", "salary_source", "salary_monthly_mxn", "comp_fit", "comp_adjustment", "direct_url", "linkedin_url", "score_reason",
 ]
 view = df[[c for c in view_cols if c in df.columns]].rename(columns={
     "astra_score": "Score",
@@ -195,6 +211,9 @@ view = df[[c for c in view_cols if c in df.columns]].rename(columns={
     "sources": "Fuentes",
     "salary": "Salario",
     "salary_source": "Fuente salario",
+    "salary_monthly_mxn": "MXN/mes",
+    "comp_fit": "Fit compensación",
+    "comp_adjustment": "Δ Score",
     "direct_url": "Aplicar",
     "linkedin_url": "LinkedIn",
     "score_reason": "Razón score",
@@ -206,6 +225,8 @@ st.dataframe(
     hide_index=True,
     column_config={
         "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
+        "MXN/mes": st.column_config.NumberColumn("MXN/mes", format="$%.0f"),
+        "Δ Score": st.column_config.NumberColumn("Δ Score", format="%d"),
         "Aplicar": st.column_config.LinkColumn("Aplicar", display_text="Abrir"),
         "LinkedIn": st.column_config.LinkColumn("LinkedIn", display_text="Ver"),
     },
@@ -216,7 +237,7 @@ st.download_button("Descargar resultados CSV", csv_bytes, file_name="astra_finan
 
 st.divider()
 st.subheader("Salarios")
-st.caption("Astra usa primero el salario estructurado de la fuente. Si no existe, intenta detectar rangos dentro de la descripción del puesto. La columna Fuente salario distingue ambos casos; una cifra detectada nunca se presenta como estimación de mercado.")
+st.caption("Astra usa primero el salario estructurado de la fuente. Si no existe, intenta detectar rangos dentro de la descripción del puesto. Cuando puede normalizarlo a MXN/mes, compara la compensación con tus pisos por nivel y ajusta el Score Astra. Si la vacante no publica salario, no recibe penalización.")
 
 st.subheader("Cómo leer el Score Astra")
 st.caption("El score prioriza seniority, empresa objetivo, fuente ATS directa, frescura y señales como salario publicado. No elimina vacantes: el filtro por defecto muestra Executive/Senior/Manager y puedes abrir IC/Other cuando quieras.")
