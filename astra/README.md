@@ -83,7 +83,6 @@ Greenhouse no proporciona de forma consistente una fecha original de publicació
 
 No se conecta a tu sesión personal de LinkedIn, no usa cookies de tu cuenta y no automatiza solicitudes de empleo. LinkedIn puede cambiar o limitar sus endpoints; por eso Astra está diseñado como un agregador híbrido y no depende de una sola fuente.
 
-
 ## Score Astra
 
 El score no reemplaza el juicio humano. Sirve para ordenar el ruido:
@@ -98,7 +97,6 @@ El score no reemplaza el juicio humano. Sirve para ordenar el ruido:
 ## Corrección de Workday v3
 
 Algunos tenants Workday devuelven `total=0` aunque sí regresen páginas de vacantes. Astra ya no corta la paginación por ese valor: continúa mientras reciba páginas completas, hasta llegar al final o al límite de seguridad.
-
 
 ## Salarios en v3.1
 
@@ -115,7 +113,6 @@ Para proteger la cobertura de LinkedIn frente a 429, Astra **no abre automática
 ## Todo México
 
 Selecciona **Todo México** en Ubicación. Esa opción reemplaza las ciudades individuales durante la corrida. LinkedIn/Indeed/Glassdoor buscan a nivel país, los ATS aceptan cualquier ubicación mexicana y OCC omite el filtro estatal. La tabla conserva la ubicación original y clasifica la región cuando es posible.
-
 
 ## Compensation Fit v3.2
 
@@ -144,7 +141,6 @@ La tabla muestra:
 - `Fit compensación`: comparación contra el piso configurado.
 - `Δ Score`: ajuste aplicado al Score Astra.
 
-
 ## LinkedIn priority enrichment v3.3
 
 LinkedIn search cards normally provide title, company, location and date, but not always compensation or description. Astra now enriches a **small priority subset**:
@@ -169,7 +165,6 @@ Settings live in `config.json`:
   "linkedin_enrichment_delay_seconds": 3.0
 }
 ```
-
 
 ## LinkedIn detail diagnostics v3.4
 
