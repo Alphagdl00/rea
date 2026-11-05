@@ -132,9 +132,14 @@ def city_bucket(location: Any, requested_city: str | None = None) -> str:
     for city, aliases in CITY_ALIASES.items():
         if any(_ascii(a) in loc for a in aliases):
             return city
+    region_matches: list[tuple[int, str]] = []
     for region, aliases in MEXICO_REGION_ALIASES.items():
-        if any(_ascii(a) in loc for a in aliases):
-            return region
+        for alias in aliases:
+            normalized = _ascii(alias)
+            if normalized and normalized in loc:
+                region_matches.append((len(normalized), region))
+    if region_matches:
+        return max(region_matches, key=lambda x: x[0])[1]
     return "Otra México" if is_mexico_location(location) else "Otra"
 
 
@@ -142,9 +147,11 @@ def is_mexico_location(location: Any) -> bool:
     loc = _ascii(location)
     if not loc:
         return False
-    if "mexico" in loc or "méxico" in str(location).lower():
+    if "new mexico" in loc or "united states" in loc or re.search(r"\busa\b", loc):
+        return False
+    if any(_ascii(alias) in loc for aliases in MEXICO_REGION_ALIASES.values() for alias in aliases):
         return True
-    return any(_ascii(alias) in loc for aliases in MEXICO_REGION_ALIASES.values() for alias in aliases)
+    return bool(re.search(r"\b(mexico|mexico city|cdmx)\b", loc))
 
 
 def normalize_board_date(value: Any) -> tuple[datetime | None, str, str]:
