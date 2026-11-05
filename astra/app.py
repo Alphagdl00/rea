@@ -12,6 +12,7 @@ from astra_core import init_db, run_search, upsert_jobs
 BASE = Path(__file__).resolve().parent
 CONFIG_PATH = BASE / "config.json"
 ATS_PATH = BASE / "ats_sources.csv"
+TARGET_COMPANIES_PATH = BASE / "target_companies.csv"
 DB_PATH = BASE / "data" / "astra_jobs.db"
 MX_TZ = ZoneInfo("America/Mexico_City")
 
@@ -39,6 +40,10 @@ with st.sidebar:
     use_indeed = st.checkbox("Indeed", value=False)
     use_glassdoor = st.checkbox("Glassdoor", value=False)
     results_wanted = st.slider("Resultados por consulta/fuente", min_value=20, max_value=100, value=50, step=10)
+    st.subheader("Prioridad")
+    seniority_default = ["Executive", "Senior", "Manager"]
+    minimum_score = st.slider("Score Astra mínimo", min_value=0, max_value=100, value=50, step=5)
+    only_priority = st.checkbox("Solo empresas objetivo", value=False)
     search_now = st.button("Buscar ahora", type="primary", use_container_width=True)
     st.caption("No requiere iniciar sesión en LinkedIn. Si LinkedIn limita peticiones, Astra conserva ATS y muestra el error sin inventar resultados.")
 
@@ -64,7 +69,10 @@ if search_now:
             status.info(msg)
 
         with st.spinner("Buscando vacantes reales..."):
-            jobs, errors = run_search(config, cities, window, sources, results_wanted, ATS_PATH, progress)
+            jobs, errors = run_search(
+                config, cities, window, sources, results_wanted, ATS_PATH, progress,
+                target_companies_path=TARGET_COMPANIES_PATH,
+            )
             upsert_jobs(DB_PATH, jobs)
             st.session_state["jobs"] = jobs
             st.session_state["errors"] = errors
@@ -89,21 +97,32 @@ if not jobs:
 
 raw = pd.DataFrame(jobs)
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Vacantes únicas", len(raw))
 recent_count = int(raw["freshness"].isin(["HOY (sin hora)", "HOT 0–24h"]).sum())
 c2.metric("Hoy / ≤24h", recent_count)
-c3.metric("ATS presentes", int(raw["sources"].str.contains("workday|greenhouse|lever|ashby", case=False, na=False).sum()))
-c4.metric("LinkedIn", "PARCIAL" if linkedin_partial else int(raw["sources"].str.contains("linkedin", case=False, na=False).sum()))
+c3.metric("Manager+", int(raw["seniority"].isin(["Executive", "Senior", "Manager"]).sum()))
+c4.metric("ATS presentes", int(raw["sources"].str.contains("workday|greenhouse|lever|ashby|smartrecruiters", case=False, na=False).sum()))
+c5.metric("LinkedIn", "PARCIAL" if linkedin_partial else int(raw["sources"].str.contains("linkedin", case=False, na=False).sum()))
 
-st.subheader("Resultados")
-f1, f2, f3 = st.columns([2, 1, 1])
+st.subheader("Resultados priorizados")
+f1, f2, f3, f4 = st.columns([2, 1, 1, 1])
 text_filter = f1.text_input("Filtrar título / empresa", placeholder="Ej. director, controller, pharma...")
 city_filter = f2.multiselect("Ciudad", sorted(raw["city"].dropna().unique().tolist()), default=[])
+seniority_filter = f3.multiselect(
+    "Nivel",
+    ["Executive", "Senior", "Manager", "Other", "IC"],
+    default=[x for x in seniority_default if x in set(raw["seniority"].dropna())],
+)
 fresh_options = [x for x in ["HOY (sin hora)", "AYER (sin hora)", "HOT 0–24h", "FRESH 24–48h", "FECHA APROX."] if x in set(raw["freshness"].dropna())]
-fresh_filter = f3.multiselect("Ventana", fresh_options, default=[])
+fresh_filter = f4.multiselect("Ventana", fresh_options, default=[])
 
 df = raw.copy()
+df = df[df["astra_score"] >= minimum_score]
+if seniority_filter:
+    df = df[df["seniority"].isin(seniority_filter)]
+if only_priority:
+    df = df[df["priority_company"] == True]
 if text_filter:
     needle = text_filter.lower()
     df = df[df.apply(lambda r: needle in str(r.get("title", "")).lower() or needle in str(r.get("company", "")).lower(), axis=1)]
@@ -145,11 +164,16 @@ df["Fecha fuente"] = df["date_kind"].map({
     "updated_at": "Actualización",
 }).fillna(df["date_kind"])
 
+df = df.sort_values(["astra_score", "sort_age"], ascending=[False, True])
+
+df["Objetivo"] = df["priority_company"].apply(lambda x: "★" if bool(x) else "")
 view_cols = [
-    "freshness", "Edad", "title", "company", "city", "location", "sources",
-    "Publicado / actualizado", "Fecha fuente", "salary", "direct_url", "linkedin_url",
+    "astra_score", "seniority", "Objetivo", "freshness", "Edad", "title", "company", "city", "location", "sources",
+    "Publicado / actualizado", "Fecha fuente", "salary", "direct_url", "linkedin_url", "score_reason",
 ]
 view = df[[c for c in view_cols if c in df.columns]].rename(columns={
+    "astra_score": "Score",
+    "seniority": "Nivel",
     "freshness": "Ventana",
     "title": "Puesto",
     "company": "Empresa",
@@ -159,6 +183,7 @@ view = df[[c for c in view_cols if c in df.columns]].rename(columns={
     "salary": "Salario",
     "direct_url": "Aplicar",
     "linkedin_url": "LinkedIn",
+    "score_reason": "Razón score",
 })
 
 st.dataframe(
@@ -166,6 +191,7 @@ st.dataframe(
     use_container_width=True,
     hide_index=True,
     column_config={
+        "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
         "Aplicar": st.column_config.LinkColumn("Aplicar", display_text="Abrir"),
         "LinkedIn": st.column_config.LinkColumn("LinkedIn", display_text="Ver"),
     },
@@ -175,5 +201,8 @@ csv_bytes = view.to_csv(index=False).encode("utf-8-sig")
 st.download_button("Descargar resultados CSV", csv_bytes, file_name="astra_finance_jobs.csv", mime="text/csv")
 
 st.divider()
+st.subheader("Cómo leer el Score Astra")
+st.caption("El score prioriza seniority, empresa objetivo, fuente ATS directa, frescura y señales como salario publicado. No elimina vacantes: el filtro por defecto muestra Executive/Senior/Manager y puedes abrir IC/Other cuando quieras.")
+
 st.subheader("Cómo interpretar las fechas")
 st.caption("LinkedIn/JobSpy entrega la fecha de publicación, pero no la hora: Astra muestra HOY/AYER y 'sin hora exacta' en lugar de inventar precisión. Lever y Ashby pueden entregar timestamps; Workday suele entregar una etiqueta relativa. Greenhouse expone updated_at, que Astra marca como actualización.")

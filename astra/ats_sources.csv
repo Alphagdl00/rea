@@ -2,3 +2,15 @@ company,ats,board,enabled
 Authentic Brands Group,greenhouse,authenticbrandsgroup,true
 Takeda,workday,https://takeda.wd502.myworkdayjobs.com/External,true
 Ipsen,workday,https://ipsen.wd103.myworkdayjobs.com/ipsen_careers,true
+Aptiv,workday,https://aptiv.wd5.myworkdayjobs.com/APTIV_CAREERS,true
+Baxter,workday,https://baxter.wd1.myworkdayjobs.com/baxter,true
+BorgWarner,workday,https://borgwarner.wd5.myworkdayjobs.com/BorgWarner_Careers,true
+Carrier,workday,https://carrier.wd5.myworkdayjobs.com/jobs,true
+Flex,workday,https://flextronics.wd1.myworkdayjobs.com/Careers,true
+HPE,workday,https://hpe.wd5.myworkdayjobs.com/WFMathpe,true
+HP,workday,https://hp.wd5.myworkdayjobs.com/ExternalCareerSite,true
+IQVIA,workday,https://iqvia.wd1.myworkdayjobs.com/IQVIA,true
+Jabil,workday,https://jabil.wd5.myworkdayjobs.com/Jabil_Careers,true
+Medtronic,workday,https://medtronic.wd1.myworkdayjobs.com/MedtronicCareers,true
+Stryker,workday,https://stryker.wd1.myworkdayjobs.com/StrykerCareers,true
+Bosch,smartrecruiters,BoschGroup,true
