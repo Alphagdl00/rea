@@ -4,6 +4,13 @@
     "(controller OR controllership OR treasury OR tesoreria)",
     "(\"finance business partner\" OR \"commercial finance\" OR \"plant finance\" OR \"corporate finance\" OR \"accounting manager\")"
   ],
+  "occ_queries": [
+    "finanzas",
+    "finance",
+    "controller",
+    "gerente de finanzas"
+  ],
+  "occ_max_pages": 2,
   "default_cities": ["Guadalajara", "Monterrey", "CDMX"],
   "default_hours": 48
 }
