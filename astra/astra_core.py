@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import html as html_lib
 import json
 import re
 import sqlite3
@@ -85,6 +86,7 @@ def clean_html(text: Any) -> str:
     if not text:
         return ""
     s = re.sub(r"<[^>]+>", " ", str(text))
+    s = html_lib.unescape(s)
     return re.sub(r"\s+", " ", s).strip()
 
 
@@ -480,6 +482,175 @@ def search_job_boards(
     return rows, errors
 
 
+def _slugify(value: Any) -> str:
+    s = _ascii(value)
+    return re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+
+
+def _occ_search_url(query: str, state: str | None, page: int) -> str:
+    q = _slugify(query)
+    keyword = f"de-{q}" if page <= 1 else f"de-{q}-pagina-{page}"
+    suffix = f"en-{_slugify(state)}/" if state else ""
+    return f"https://www.occ.com.mx/empleos/{keyword}/{suffix}"
+
+
+def _occ_posted(label: str) -> tuple[datetime | None, str, str]:
+    plain = _ascii(label)
+    now = datetime.now(MX_TZ)
+    if "hoy" in plain:
+        d = now.date()
+        return datetime(d.year, d.month, d.day, 12, tzinfo=MX_TZ).astimezone(timezone.utc), "posted_date", d.isoformat()
+    if "ayer" in plain:
+        d = (now - timedelta(days=1)).date()
+        return datetime(d.year, d.month, d.day, 12, tzinfo=MX_TZ).astimezone(timezone.utc), "posted_date", d.isoformat()
+    m = re.search(r"hace\s+(\d+)\s+hora", plain)
+    if m:
+        dt = utcnow() - timedelta(hours=int(m.group(1)))
+        return dt, "relative_posted", label
+    m = re.search(r"hace\s+(\d+)\s+dia", plain)
+    if m:
+        d = (now - timedelta(days=int(m.group(1)))).date()
+        return datetime(d.year, d.month, d.day, 12, tzinfo=MX_TZ).astimezone(timezone.utc), "posted_date", d.isoformat()
+    return None, "unknown", label
+
+
+def _parse_occ_cards(page_html: str) -> list[dict[str, Any]]:
+    cards: list[dict[str, Any]] = []
+    chunks = str(page_html).split('class="card-job-offer')
+    for chunk in chunks[1:]:
+        id_match = re.search(r"data-id=['\"](\d+)['\"]", chunk)
+        title_match = re.search(r"<h2[^>]*>([\s\S]*?)</h2>", chunk, flags=re.I)
+        if not id_match or not title_match:
+            continue
+        job_id = id_match.group(1)
+        title = clean_html(title_match.group(1))
+        if not title:
+            continue
+
+        company_match = re.search(r"h-\[21px\][^>]*>\s*<span[^>]*>([\s\S]*?)</span>", chunk, flags=re.I)
+        location_match = re.search(r"no-alter-loc-text[^>]*>[\s\S]*?<p[^>]*>([\s\S]*?)</p>", chunk, flags=re.I)
+        company = clean_html(company_match.group(1)) if company_match else ""
+        if _ascii(company) == "empresa confidencial":
+            company = "?"
+        location = clean_html(location_match.group(1)) if location_match else ""
+
+        plain = clean_html(chunk)
+        date_match = re.search(r"\b(Hoy|Ayer|Hace\s+\d+\s+(?:horas?|d[ií]as?))\b", plain, flags=re.I)
+        posted_label = date_match.group(1) if date_match else ""
+        posted_at, date_kind, normalized_label = _occ_posted(posted_label)
+
+        salary_hit = extract_salary_from_text(plain, strict=False)
+        card = {
+            "id": job_id,
+            "title": title,
+            "company": company,
+            "location": location,
+            "posted_at": posted_at,
+            "date_kind": date_kind,
+            "posted_label": normalized_label or posted_label,
+            "job_url": f"https://www.occ.com.mx/empleo/oferta/{job_id}/",
+        }
+        if salary_hit:
+            card.update({k: salary_hit[k] for k in ("min_amount", "max_amount", "currency", "interval")})
+            card["salary_raw"] = salary_hit["raw"]
+        cards.append(card)
+    return cards
+
+
+def search_occ(
+    cities: list[str], hours_old: int, queries: list[str], max_pages: int = 2,
+    progress: Callable[[str], None] | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/156.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-MX,es;q=0.9,en;q=0.7",
+    })
+
+    scopes: list[tuple[str, str | None]]
+    if "Todo México" in cities:
+        scopes = [("Todo México", None)]
+    else:
+        scopes = [(c, OCC_STATE_SLUGS.get(c)) for c in cities]
+
+    seen: set[str] = set()
+    total = max(1, len(scopes) * len(queries) * max_pages)
+    step = 0
+    for scope_name, state in scopes:
+        for query in queries:
+            first_page_answered = False
+            for page in range(1, max_pages + 1):
+                step += 1
+                if progress:
+                    progress(f"OCC {step}/{total}: {query} · {scope_name} · pág {page}")
+                url = _occ_search_url(query, state, page)
+                try:
+                    response = session.get(url, timeout=30)
+                    if response.status_code != 200:
+                        raise RuntimeError(f"HTTP {response.status_code}")
+                    cards = _parse_occ_cards(response.text)
+                    if page == 1:
+                        first_page_answered = True
+                    if not cards:
+                        plain = _ascii(clean_html(response.text))
+                        if page == 1 and "no hay empleos que coincidan" not in plain:
+                            errors.append(f"OCC · {query} · {scope_name}: cero tarjetas; posible challenge o cambio de markup")
+                        break
+
+                    fresh = 0
+                    for card in cards:
+                        if card["id"] in seen:
+                            continue
+                        seen.add(card["id"])
+                        fresh += 1
+
+                        resolved_city = city_bucket(card.get("location"))
+                        if scope_name != "Todo México" and resolved_city != scope_name:
+                            continue
+                        if scope_name == "Todo México" and resolved_city == "Otra" and not is_mexico_location(card.get("location")):
+                            continue
+
+                        row = _row_base(
+                            id=f"occ-{card['id']}", source="occ", title=card.get("title") or "",
+                            company=card.get("company") or "?", location=card.get("location") or "",
+                            city=resolved_city if resolved_city != "Otra" else "Otra México",
+                            posted_at=card.get("posted_at"), date_kind=card.get("date_kind") or "unknown",
+                            posted_label=card.get("posted_label") or "", job_url=card.get("job_url") or "",
+                            direct_url=card.get("job_url") or "", description="",
+                            min_amount=card.get("min_amount"), max_amount=card.get("max_amount"),
+                            currency=card.get("currency") or "", interval=card.get("interval") or "",
+                            salary_source="OCC" if card.get("min_amount") is not None else "",
+                            salary_raw=card.get("salary_raw") or "",
+                        )
+                        if not is_finance_job(row) or row.get("posted_at") is None:
+                            continue
+
+                        if row.get("date_kind") == "posted_date":
+                            days = local_days_ago(row.get("posted_at"))
+                            max_days = 0 if hours_old <= 24 else 1
+                            if days is None or not (0 <= days <= max_days):
+                                continue
+                        else:
+                            age = age_hours(row.get("posted_at"))
+                            if age is None or age > hours_old + 1:
+                                continue
+                        rows.append(row)
+
+                    if fresh == 0:
+                        break
+                except Exception as exc:
+                    if page == 1:
+                        errors.append(f"OCC · {query} · {scope_name}: {exc}")
+                    break
+                time.sleep(0.8)
+            if not first_page_answered:
+                continue
+    return rows, list(dict.fromkeys(errors))
+
+
 def load_ats_sources(path: str | Path) -> list[dict[str, str]]:
     p = Path(path)
     if not p.exists():
@@ -725,6 +896,13 @@ def merge_dedupe(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         best["sources"] = ", ".join(dict.fromkeys(str(i.get("source")) for i in items if i.get("source")))
         best["linkedin_url"] = next((str(i.get("job_url")) for i in items if i.get("source") == "linkedin" and i.get("job_url")), "")
         best["direct_url"] = next((str(i.get("direct_url")) for i in items if i.get("source") in {"workday", "greenhouse", "lever", "ashby", "smartrecruiters"} and i.get("direct_url")), best.get("direct_url") or best.get("job_url") or "")
+        salary_item = next((i for i in items if i.get("salary")), None)
+        if salary_item:
+            for field in ("salary", "salary_source", "salary_raw", "min_amount", "max_amount", "currency", "interval"):
+                best[field] = salary_item.get(field)
+        description_item = next((i for i in items if i.get("description")), None)
+        if description_item and not best.get("description"):
+            best["description"] = description_item.get("description")
         dts = [parse_dt(i.get("posted_at")) for i in items if parse_dt(i.get("posted_at"))]
         if dts:
             best["posted_at"] = max(dts)
@@ -808,6 +986,9 @@ def run_search(config: dict[str, Any], cities: list[str], hours_old: int, source
         rows.extend(r); errors.extend(e)
     if "ats" in sources:
         r, e = fetch_ats(load_ats_sources(ats_csv), hours_old, cities, progress)
+        rows.extend(r); errors.extend(e)
+    if "occ" in sources:
+        r, e = search_occ(cities, hours_old, config.get("occ_queries", ["finanzas", "finance", "controller", "gerente de finanzas"]), int(config.get("occ_max_pages", 2)), progress)
         rows.extend(r); errors.extend(e)
     merged = merge_dedupe(rows)
     return enrich_ranking(merged, target_companies_path), list(dict.fromkeys(errors))
