@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
-USER_AGENT = "AstraFinanceRadar/3.3 (+local job-search tool)"
+USER_AGENT = "AstraFinanceRadar/3.4 (+local job-search tool)"
 MX_TZ = ZoneInfo("America/Mexico_City")
 FINANCE_TITLE_TERMS = (
     "finance", "financial", "fp&a", "fp & a", "financial planning", "controller",
@@ -845,14 +845,17 @@ def enrich_linkedin_priority_details(
     delay_seconds: float = 3.0,
     progress: Callable[[str], None] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Enrich only high-seniority LinkedIn jobs without salary.
+    """Enrich high-priority LinkedIn jobs using JobSpy's own detail parser.
 
-    Uses public job pages, no account/session cookies. Stops on 429.
+    Uses public LinkedIn pages only. Stops on 429 / blocked responses.
     """
     try:
-        from bs4 import BeautifulSoup
+        from jobspy.linkedin import LinkedIn
+        from jobspy.linkedin.constant import headers as linkedin_headers
+        from jobspy.model import Country, DescriptionFormat, ScraperInput, Site
+        from jobspy.util import RequestsRotating, create_session
     except Exception as exc:
-        return rows, [f"LinkedIn detail enrichment unavailable: {exc}"]
+        return rows, [f"LinkedIn detalle no disponible: {exc}"]
 
     candidates = [
         row for row in rows
@@ -871,50 +874,88 @@ def enrich_linkedin_priority_details(
     if not candidates:
         return rows, []
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/156.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "es-MX,es;q=0.9,en;q=0.7",
-    })
+    scraper = LinkedIn()
+    scraper.scraper_input = ScraperInput(
+        site_name=[Site.LINKEDIN],
+        country_indeed=Country.MEXICO,
+        fetch_description=True,
+        description_format=DescriptionFormat.PLAIN,
+    )
+    scraper.session = create_session(
+        RequestsRotating(clear_cookies=True),
+        scraper.scraper_input,
+        linkedin_headers,
+    )
+
     errors: list[str] = []
+    enriched = 0
+    salary_hits = 0
+    attempted = 0
 
     for idx, row in enumerate(candidates, start=1):
-        url = str(row.get("linkedin_url") or row.get("job_url") or "")
+        attempted += 1
         if progress:
             progress(f"LinkedIn detalle {idx}/{len(candidates)}: {row.get('title')} · {row.get('company')}")
+
+        raw_id = str(row.get("id") or "")
+        m = re.search(r"(\d{6,})", raw_id)
+        if not m:
+            m = re.search(r"/jobs/view/(\d+)", str(row.get("linkedin_url") or row.get("job_url") or ""))
+        if not m:
+            errors.append(f"LinkedIn detalle: no se pudo obtener job id para {row.get('title')} · {row.get('company')}")
+            continue
+
+        job_id = m.group(1)
         try:
-            response = session.get(url, timeout=25, allow_redirects=True)
-            if response.status_code == 429:
-                errors.append("LinkedIn detalle: 429; enrichment detenido para proteger la cobertura")
+            details = scraper._fetch_details(job_id)
+            if scraper.error and ("429" in scraper.error or "blocked" in scraper.error.lower()):
+                errors.append("LinkedIn detalle: 429/bloqueo; enrichment detenido")
                 break
-            if response.status_code != 200:
-                errors.append(f"LinkedIn detalle {row.get('id')}: HTTP {response.status_code}")
-                continue
 
-            soup = BeautifulSoup(response.text, "html.parser")
-            desc_tag = soup.find("div", class_="show-more-less-html__markup")
-            description = clean_html(desc_tag.get_text(" ", strip=True) if desc_tag else "")
-            salary_tag = soup.find("div", class_="compensation__salary")
-            salary_text_raw = clean_html(salary_tag.get_text(" ", strip=True) if salary_tag else "")
-
-            if description and not row.get("description"):
+            description = clean_html(details.get("description") or "")
+            if description:
                 row["description"] = description
 
-            hit = _linkedin_salary_from_text(salary_text_raw) if salary_text_raw else None
-            if not hit and description:
-                hit = extract_salary_from_text(description, strict=True)
-            if hit:
-                row.update({k: hit[k] for k in ("min_amount", "max_amount", "currency", "interval")})
+            lo = details.get("min_amount")
+            hi = details.get("max_amount")
+            currency = details.get("currency")
+            interval = details.get("interval")
+            if hasattr(interval, "value"):
+                interval = interval.value
+
+            if lo is not None or hi is not None:
+                row["min_amount"] = lo
+                row["max_amount"] = hi
+                row["currency"] = str(currency or "")
+                row["interval"] = str(interval or "")
                 row["salary"] = salary_text(row)
                 row["salary_source"] = "LinkedIn detalle"
-                row["salary_raw"] = hit["raw"]
+                salary_hits += 1
+            elif description:
+                hit = extract_salary_from_text(description, strict=True)
+                if not hit:
+                    # High-priority role fallback: require an explicit pay period near the amount.
+                    hit = _linkedin_salary_from_text(description)
+                if hit:
+                    row.update({k: hit[k] for k in ("min_amount", "max_amount", "currency", "interval")})
+                    row["salary"] = salary_text(row)
+                    row["salary_source"] = "LinkedIn descripción"
+                    row["salary_raw"] = hit["raw"]
+                    salary_hits += 1
+
+            if description or row.get("salary"):
+                enriched += 1
         except Exception as exc:
-            errors.append(f"LinkedIn detalle {row.get('id')}: {exc}")
+            message = str(exc)
+            if "429" in message or "blocked" in message.lower():
+                errors.append("LinkedIn detalle: 429/bloqueo; enrichment detenido")
+                break
+            errors.append(f"LinkedIn detalle {job_id}: {message}")
 
         if idx < len(candidates):
             time.sleep(max(0.0, float(delay_seconds)))
 
+    errors.append(f"LinkedIn detalle resumen: {enriched}/{attempted} enriquecidas; {salary_hits} con salario")
     return rows, list(dict.fromkeys(errors))
 
 
