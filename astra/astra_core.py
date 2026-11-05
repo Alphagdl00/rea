@@ -334,7 +334,7 @@ def apply_compensation_fit(
     floors: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     for row in rows:
-        base_score = int(row.get("astra_score") or 0)
+        base_score = int(row.get("score_base") if row.get("score_base") is not None else (row.get("astra_score") or 0))
         adjustment, label, monthly, floor = compensation_fit(row, floors)
         row["score_base"] = base_score
         row["comp_adjustment"] = adjustment
