@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
-USER_AGENT = "AstraFinanceRadar/3.2 (+local job-search tool)"
+USER_AGENT = "AstraFinanceRadar/3.3 (+local job-search tool)"
 MX_TZ = ZoneInfo("America/Mexico_City")
 FINANCE_TITLE_TERMS = (
     "finance", "financial", "fp&a", "fp & a", "financial planning", "controller",
@@ -828,6 +828,96 @@ def search_occ(
     return rows, list(dict.fromkeys(errors))
 
 
+def _linkedin_salary_from_text(text: str) -> dict[str, Any] | None:
+    normalized = str(text or "")
+    normalized = re.sub(r"(?i)/\s*(mo|month)", " monthly", normalized)
+    normalized = re.sub(r"(?i)/\s*(yr|year)", " annual", normalized)
+    normalized = re.sub(r"(?i)/\s*(hr|hour)", " hourly", normalized)
+    normalized = re.sub(r"(?i)\bper\s+month\b", " monthly", normalized)
+    normalized = re.sub(r"(?i)\bper\s+year\b", " annual", normalized)
+    normalized = re.sub(r"(?i)\bper\s+hour\b", " hourly", normalized)
+    return extract_salary_from_text("salary " + normalized, strict=False)
+
+
+def enrich_linkedin_priority_details(
+    rows: list[dict[str, Any]],
+    max_jobs: int = 8,
+    delay_seconds: float = 3.0,
+    progress: Callable[[str], None] | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Enrich only high-seniority LinkedIn jobs without salary.
+
+    Uses public job pages, no account/session cookies. Stops on 429.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except Exception as exc:
+        return rows, [f"LinkedIn detail enrichment unavailable: {exc}"]
+
+    candidates = [
+        row for row in rows
+        if "linkedin" in _ascii(row.get("sources") or row.get("source"))
+        and not row.get("salary")
+        and classify_seniority(row.get("title")) in {"Executive", "Senior", "Manager"}
+        and (row.get("linkedin_url") or row.get("job_url"))
+    ]
+    candidates.sort(
+        key=lambda r: (
+            {"Executive": 0, "Senior": 1, "Manager": 2}.get(classify_seniority(r.get("title")), 9),
+            r.get("sort_age", 999999),
+        )
+    )
+    candidates = candidates[: max(0, int(max_jobs))]
+    if not candidates:
+        return rows, []
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/156.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-MX,es;q=0.9,en;q=0.7",
+    })
+    errors: list[str] = []
+
+    for idx, row in enumerate(candidates, start=1):
+        url = str(row.get("linkedin_url") or row.get("job_url") or "")
+        if progress:
+            progress(f"LinkedIn detalle {idx}/{len(candidates)}: {row.get('title')} · {row.get('company')}")
+        try:
+            response = session.get(url, timeout=25, allow_redirects=True)
+            if response.status_code == 429:
+                errors.append("LinkedIn detalle: 429; enrichment detenido para proteger la cobertura")
+                break
+            if response.status_code != 200:
+                errors.append(f"LinkedIn detalle {row.get('id')}: HTTP {response.status_code}")
+                continue
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            desc_tag = soup.find("div", class_="show-more-less-html__markup")
+            description = clean_html(desc_tag.get_text(" ", strip=True) if desc_tag else "")
+            salary_tag = soup.find("div", class_="compensation__salary")
+            salary_text_raw = clean_html(salary_tag.get_text(" ", strip=True) if salary_tag else "")
+
+            if description and not row.get("description"):
+                row["description"] = description
+
+            hit = _linkedin_salary_from_text(salary_text_raw) if salary_text_raw else None
+            if not hit and description:
+                hit = extract_salary_from_text(description, strict=True)
+            if hit:
+                row.update({k: hit[k] for k in ("min_amount", "max_amount", "currency", "interval")})
+                row["salary"] = salary_text(row)
+                row["salary_source"] = "LinkedIn detalle"
+                row["salary_raw"] = hit["raw"]
+        except Exception as exc:
+            errors.append(f"LinkedIn detalle {row.get('id')}: {exc}")
+
+        if idx < len(candidates):
+            time.sleep(max(0.0, float(delay_seconds)))
+
+    return rows, list(dict.fromkeys(errors))
+
+
 def load_ats_sources(path: str | Path) -> list[dict[str, str]]:
     p = Path(path)
     if not p.exists():
@@ -1174,5 +1264,13 @@ def run_search(config: dict[str, Any], cities: list[str], hours_old: int, source
         r, e = search_occ(cities, hours_old, config.get("occ_queries", ["finanzas", "finance", "controller", "gerente de finanzas"]), int(config.get("occ_max_pages", 2)), progress)
         rows.extend(r); errors.extend(e)
     merged = merge_dedupe(rows)
+    if "linkedin" in sources and bool(config.get("linkedin_priority_enrichment", True)):
+        merged, e = enrich_linkedin_priority_details(
+            merged,
+            max_jobs=int(config.get("linkedin_enrichment_max_jobs", 8)),
+            delay_seconds=float(config.get("linkedin_enrichment_delay_seconds", 3.0)),
+            progress=progress,
+        )
+        errors.extend(e)
     ranked = enrich_ranking(merged, target_companies_path)
     return apply_compensation_fit(ranked, compensation_floors), list(dict.fromkeys(errors))
