@@ -1,11 +1,8 @@
 {
   "finance_queries": [
-    "finance",
-    "financial",
-    "FP&A",
-    "controller",
-    "treasury",
-    "accounting manager"
+    "(finance OR financial OR \"FP&A\")",
+    "(controller OR controllership OR treasury OR tesoreria)",
+    "(\"finance business partner\" OR \"commercial finance\" OR \"plant finance\" OR \"corporate finance\" OR \"accounting manager\")"
   ],
   "default_cities": ["Guadalajara", "Monterrey", "CDMX"],
   "default_hours": 48

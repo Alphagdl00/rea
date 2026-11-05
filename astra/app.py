@@ -73,8 +73,13 @@ if search_now:
 jobs = st.session_state.get("jobs", [])
 errors = st.session_state.get("errors", [])
 
+linkedin_partial = any("linkedin" in e.lower() and "429" in e.lower() for e in errors)
+
+if linkedin_partial:
+    st.error("Cobertura LinkedIn: PARCIAL. LinkedIn limitó peticiones (429). Los resultados mostrados son reales, pero esta corrida puede estar incompleta.")
+
 if errors:
-    with st.expander(f"Avisos de fuentes ({len(errors)})", expanded=False):
+    with st.expander(f"Avisos de fuentes ({len(errors)})", expanded=linkedin_partial):
         for e in errors:
             st.warning(e)
 
@@ -86,15 +91,17 @@ raw = pd.DataFrame(jobs)
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Vacantes únicas", len(raw))
-c2.metric("HOT ≤24h", int((raw["age_hours"] <= 24).sum()))
+recent_count = int(raw["freshness"].isin(["HOY (sin hora)", "HOT 0–24h"]).sum())
+c2.metric("Hoy / ≤24h", recent_count)
 c3.metric("ATS presentes", int(raw["sources"].str.contains("workday|greenhouse|lever|ashby", case=False, na=False).sum()))
-c4.metric("Con LinkedIn", int(raw["sources"].str.contains("linkedin", case=False, na=False).sum()))
+c4.metric("LinkedIn", "PARCIAL" if linkedin_partial else int(raw["sources"].str.contains("linkedin", case=False, na=False).sum()))
 
 st.subheader("Resultados")
 f1, f2, f3 = st.columns([2, 1, 1])
 text_filter = f1.text_input("Filtrar título / empresa", placeholder="Ej. director, controller, pharma...")
 city_filter = f2.multiselect("Ciudad", sorted(raw["city"].dropna().unique().tolist()), default=[])
-fresh_filter = f3.multiselect("Ventana", ["HOT 0–24h", "FRESH 24–48h"], default=[])
+fresh_options = [x for x in ["HOY (sin hora)", "AYER (sin hora)", "HOT 0–24h", "FRESH 24–48h", "FECHA APROX."] if x in set(raw["freshness"].dropna())]
+fresh_filter = f3.multiselect("Ventana", fresh_options, default=[])
 
 df = raw.copy()
 if text_filter:
@@ -114,9 +121,23 @@ def local_time(v):
         return ""
 
 
-df["Publicado / actualizado"] = df["posted_at"].apply(local_time)
-df["Edad"] = df["age_hours"].apply(lambda x: f"{x:.1f} h" if pd.notna(x) else "")
+def published_display(row):
+    if row.get("date_kind") == "posted_date":
+        return str(row.get("posted_label") or "")
+    return local_time(row.get("posted_at"))
+
+
+def age_display(row):
+    if row.get("date_kind") == "posted_date":
+        return "sin hora exacta"
+    x = row.get("age_hours")
+    return f"{x:.1f} h" if pd.notna(x) and x is not None else ""
+
+
+df["Publicado / actualizado"] = df.apply(published_display, axis=1)
+df["Edad"] = df.apply(age_display, axis=1)
 df["Fecha fuente"] = df["date_kind"].map({
+    "posted_date": "Publicación (solo fecha)",
     "posted_at": "Publicación",
     "published_at": "Publicación",
     "created_at": "Creación/publicación",
@@ -155,4 +176,4 @@ st.download_button("Descargar resultados CSV", csv_bytes, file_name="astra_finan
 
 st.divider()
 st.subheader("Cómo interpretar las fechas")
-st.caption("LinkedIn/JobSpy, Lever y Ashby entregan fecha de publicación/creación. Workday suele entregar una etiqueta relativa ('Today', '2 Days Ago'). Greenhouse expone updated_at, por lo que Astra la marca explícitamente como actualización y no la presenta como fecha original de publicación.")
+st.caption("LinkedIn/JobSpy entrega la fecha de publicación, pero no la hora: Astra muestra HOY/AYER y 'sin hora exacta' en lugar de inventar precisión. Lever y Ashby pueden entregar timestamps; Workday suele entregar una etiqueta relativa. Greenhouse expone updated_at, que Astra marca como actualización.")

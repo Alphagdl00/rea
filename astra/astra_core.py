@@ -7,15 +7,17 @@ import re
 import sqlite3
 import time
 import unicodedata
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 
-USER_AGENT = "AstraFinanceRadar/2.0 (+local job-search tool)"
+USER_AGENT = "AstraFinanceRadar/2.1 (+local job-search tool)"
+MX_TZ = ZoneInfo("America/Mexico_City")
 FINANCE_TITLE_TERMS = (
     "finance", "financial", "fp&a", "fp & a", "financial planning", "controller",
     "controllership", "controlling", "treasury", "tesoreria", "tesorería",
@@ -27,7 +29,7 @@ FINANCE_FUNCTION_TERMS = ("finance", "accounting", "audit", "treasury", "financi
 CITY_ALIASES = {
     "Guadalajara": ["guadalajara", "zapopan", "tlaquepaque", "tlajomulco", "el salto"],
     "Monterrey": ["monterrey", "san pedro garza garcia", "san pedro garza garcía", "apodaca", "santa catarina", "escobedo"],
-    "CDMX": ["ciudad de mexico", "ciudad de méxico", "mexico city", "méxico city", "cdmx", "distrito federal", "santa fe", "polanco", "miguel hidalgo", "cuajimalpa", "azcapotzalco"],
+    "CDMX": ["ciudad de mexico", "ciudad de méxico", "mexico city", "méxico city", "cdmx", "distrito federal"],
 }
 SOURCE_PRIORITY = {"workday": 0, "greenhouse": 0, "lever": 0, "ashby": 0, "linkedin": 1, "indeed": 2, "glassdoor": 3}
 
@@ -90,7 +92,35 @@ def city_bucket(location: Any, requested_city: str | None = None) -> str:
     for city, aliases in CITY_ALIASES.items():
         if any(_ascii(a) in loc for a in aliases):
             return city
-    return requested_city or "Otra"
+    return "Otra"
+
+
+def normalize_board_date(value: Any) -> tuple[datetime | None, str, str]:
+    """Preserve date-only postings instead of inventing a midnight timestamp."""
+    if isinstance(value, date) and not isinstance(value, datetime):
+        d = value
+    elif isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value.strip()):
+        try:
+            d = date.fromisoformat(value.strip())
+        except ValueError:
+            d = None
+    else:
+        d = None
+
+    if d is not None:
+        # Noon local keeps the calendar date stable across UTC conversion.
+        dt = datetime(d.year, d.month, d.day, 12, 0, tzinfo=MX_TZ).astimezone(timezone.utc)
+        return dt, "posted_date", d.isoformat()
+
+    dt = parse_dt(value)
+    return dt, "posted_at", str(value or "")
+
+
+def local_days_ago(value: Any) -> int | None:
+    dt = parse_dt(value)
+    if not dt:
+        return None
+    return (datetime.now(MX_TZ).date() - dt.astimezone(MX_TZ).date()).days
 
 
 def salary_text(row: dict[str, Any]) -> str:
@@ -169,13 +199,16 @@ def search_job_boards(
                     errors.append(f"{site}: {msg}")
                 for _, r in df.iterrows():
                     data = r.to_dict()
-                    posted = parse_dt(data.get("date_posted"))
                     source = str(data.get("site") or "").lower()
+                    posted, date_kind, posted_label = normalize_board_date(data.get("date_posted"))
+                    resolved_city = city_bucket(data.get("location"), city)
+                    if resolved_city != city:
+                        continue
                     row = _row_base(
                         id=str(data.get("id") or ""), source=source, title=str(data.get("title") or ""),
                         company=str(data.get("company") or ""), location=str(data.get("location") or ""),
-                        city=city_bucket(data.get("location"), city), posted_at=posted,
-                        date_kind="posted_at", posted_label=str(data.get("date_posted") or ""),
+                        city=resolved_city, posted_at=posted,
+                        date_kind=date_kind, posted_label=posted_label,
                         job_url=str(data.get("job_url") or ""), direct_url=str(data.get("job_url_direct") or data.get("job_url") or ""),
                         description=str(data.get("description") or ""), job_type=str(data.get("job_type") or ""),
                         job_level=str(data.get("job_level") or ""), job_function=str(data.get("job_function") or ""),
@@ -183,12 +216,20 @@ def search_job_boards(
                         interval=str(data.get("interval") or ""), is_remote=bool(data.get("is_remote") or False),
                     )
                     if is_finance_job(row):
-                        a = age_hours(row["posted_at"])
-                        if a is None or a <= hours_old + 1:
-                            rows.append(row)
+                        if row["posted_at"] is None:
+                            continue
+                        if row["date_kind"] == "posted_date":
+                            days = local_days_ago(row["posted_at"])
+                            max_days = 0 if hours_old <= 24 else 1
+                            if days is not None and 0 <= days <= max_days:
+                                rows.append(row)
+                        else:
+                            a = age_hours(row["posted_at"])
+                            if a is not None and a <= hours_old + 1:
+                                rows.append(row)
             except Exception as exc:
                 errors.append(f"{','.join(sites)} · {query} · {city}: {exc}")
-            time.sleep(0.45)
+            time.sleep(2.5 if "linkedin" in sites else 0.5)
     return rows, errors
 
 
@@ -372,10 +413,22 @@ def merge_dedupe(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         dts = [parse_dt(i.get("posted_at")) for i in items if parse_dt(i.get("posted_at"))]
         if dts:
             best["posted_at"] = max(dts)
-        best["age_hours"] = age_hours(best.get("posted_at"))
-        best["freshness"] = "HOT 0–24h" if (best["age_hours"] is not None and best["age_hours"] <= 24) else "FRESH 24–48h"
+        if best.get("date_kind") == "posted_date":
+            days = local_days_ago(best.get("posted_at"))
+            best["age_hours"] = None
+            if days == 0:
+                best["freshness"] = "HOY (sin hora)"
+            elif days == 1:
+                best["freshness"] = "AYER (sin hora)"
+            else:
+                best["freshness"] = "FECHA APROX."
+            best["sort_age"] = (days or 0) * 24
+        else:
+            best["age_hours"] = age_hours(best.get("posted_at"))
+            best["freshness"] = "HOT 0–24h" if (best["age_hours"] is not None and best["age_hours"] <= 24) else "FRESH 24–48h"
+            best["sort_age"] = best["age_hours"] if best["age_hours"] is not None else 999999
         merged.append(best)
-    merged.sort(key=lambda r: (r.get("age_hours") is None, r.get("age_hours") or 0, str(r.get("company"))))
+    merged.sort(key=lambda r: (r.get("sort_age", 999999), str(r.get("company"))))
     return merged
 
 
