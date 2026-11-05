@@ -1,3 +1,5 @@
+import { t } from "./i18n.js";
+
 function initializePercentDemo() {
   const demo = document.querySelector("[data-percent-demo]");
   if (demo === null) return;
@@ -24,11 +26,11 @@ function initializePercentDemo() {
     equals.disabled = stage !== "percent";
     status.textContent =
       stage === "input"
-        ? "Press % to see what happens to 10."
+        ? t("Press % to see what happens to 10.")
         : stage === "percent"
           ? adding
-            ? "10% of 200 is 20. Press = to add it."
-            : "For multiplication, 10 becomes 0.1. Press = to multiply."
+            ? t("10% of 200 is 20. Press = to add it.")
+            : t("For multiplication, 10 becomes 0.1. Press = to multiply.")
           : `200 ${operator} ${percent} = ${result}.`;
   };
 
@@ -55,19 +57,11 @@ function initializePercentDemo() {
   render();
 }
 
-function initializeExpertAssembly() {
-  const excerpt = document.querySelector("[data-expert-assembly]");
-  if (excerpt && window.matchMedia("(max-width: 640px)").matches) {
-    excerpt.open = false;
-  }
-}
-
 function initializeHomeNavigation() {
   const menu = document.querySelector("[data-home-nav]");
   if (menu === null) return;
   const currentLabel = menu.querySelector("[data-home-nav-current]");
   if (currentLabel === null) return;
-  const wideScreen = window.matchMedia("(min-width: 1440px)");
   const entries = Array.from(menu.querySelectorAll('a[href^="#"]'))
     .map((link) => ({
       link,
@@ -76,8 +70,12 @@ function initializeHomeNavigation() {
     .filter((entry) => entry.target !== null);
   if (entries.length === 0) return;
 
+  // CSS decides when there is room for a sidebar.
+  let sidebarLayout = window.getComputedStyle(menu).position === "fixed";
+  menu.open = sidebarLayout;
+
   const updatePosition = () => {
-    const offset = wideScreen.matches ? 40 : 88;
+    const offset = sidebarLayout ? 40 : 88;
     let current = entries[0];
     entries.forEach((entry) => {
       if (entry.target.getBoundingClientRect().top <= offset) current = entry;
@@ -105,7 +103,12 @@ function initializeHomeNavigation() {
     currentLabel.textContent = current.link.textContent;
   };
   const updateLayout = () => {
-    menu.open = wideScreen.matches;
+    const nextSidebarLayout =
+      window.getComputedStyle(menu).position === "fixed";
+    if (nextSidebarLayout !== sidebarLayout) {
+      sidebarLayout = nextSidebarLayout;
+      menu.open = sidebarLayout;
+    }
     updatePosition();
   };
   let scheduled = false;
@@ -114,12 +117,12 @@ function initializeHomeNavigation() {
     scheduled = true;
     window.requestAnimationFrame(() => {
       scheduled = false;
-      updatePosition();
+      updateLayout();
     });
   };
   entries.forEach(({ link, target }) => {
     link.addEventListener("click", () => {
-      if (!wideScreen.matches) menu.open = false;
+      if (!sidebarLayout) menu.open = false;
       const heading = target.querySelector("h2") ?? target;
       heading.setAttribute("tabindex", "-1");
       window.requestAnimationFrame(() =>
@@ -127,7 +130,6 @@ function initializeHomeNavigation() {
       );
     });
   });
-  wideScreen.addEventListener("change", updateLayout);
   window.addEventListener("scroll", schedulePosition, { passive: true });
   window.addEventListener("resize", schedulePosition, { passive: true });
   window.addEventListener("hashchange", schedulePosition);
@@ -135,6 +137,5 @@ function initializeHomeNavigation() {
   updateLayout();
 }
 
-initializeExpertAssembly();
 initializePercentDemo();
 initializeHomeNavigation();

@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { expect, onTestFinished } from "vitest";
 import { AndroidAnalysisService } from "../../../src/application/android/AndroidAnalysisService.js";
 import { createAndroidAnalysisProvider } from "../../../src/composition/android.js";
-import { ProviderCleanupError } from "../../../src/domain/providerCleanupError.js";
+import { ProviderAdapterError } from "../../../src/domain/providerAdapterError.js";
 import {
   ProviderProcessSupervisor,
   spawnOwnedProviderProcess,
@@ -27,6 +27,8 @@ const fixture = fileURLToPath(new URL("./jadx-mcp.mjs", import.meta.url));
 export const createJadxProtocolFixture = async (
   mode = "normal",
   cleanupFailure?: () => boolean,
+  inventory?: { readonly classCount?: number },
+  settings: Readonly<Record<string, string>> = {},
 ) => {
   const root = await createTestTempDirectory("rea-android-boundary-");
   const apk = join(root, "fixture.apk");
@@ -51,10 +53,17 @@ export const createJadxProtocolFixture = async (
     javaToolOptions: string | undefined;
     legacyJavaOptions: string | undefined;
   }[] = [];
+  // Inherit the host environment for process launch, but take JADX settings
+  // only from this fixture so a developer's shell cannot change the provider.
   const environment: NodeJS.ProcessEnv = {
-    ...process.env,
+    ...Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([name]) => !name.startsWith("REA_JADX_"),
+      ),
+    ),
     JAVA_HOME: javaHome,
     REA_JADX_MCP_JAR: jar,
+    ...settings,
   };
   const provider = createAndroidAnalysisProvider(
     environment,
@@ -64,7 +73,15 @@ export const createJadxProtocolFixture = async (
         command: process.execPath,
         arguments: [fixture],
         expectedCommand: process.execPath,
-        env: { ...options.env, REA_FAKE_JADX_MODE: mode },
+        env: {
+          ...options.env,
+          REA_FAKE_JADX_MODE: mode,
+          ...(inventory?.classCount === undefined
+            ? {}
+            : {
+                REA_FAKE_JADX_CLASS_COUNT: String(inventory.classCount),
+              }),
+        },
       });
       launches.push({
         runId: options.runId,
@@ -121,7 +138,8 @@ export const createJadxProtocolFixture = async (
     } catch (cause) {
       if (
         mode !== "cleanup-failure" ||
-        !(cause instanceof ProviderCleanupError) ||
+        !(cause instanceof ProviderAdapterError) ||
+        !cause.cleanupIncomplete ||
         cause.providerId !== "jadx"
       )
         throw cause;

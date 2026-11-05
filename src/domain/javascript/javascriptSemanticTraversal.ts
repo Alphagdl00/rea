@@ -1,7 +1,52 @@
 import * as t from "@babel/types";
+import {
+  isErasedJavaScriptDeclaration,
+  isTypeOnlyExportDeclaration,
+  isTypeOnlyExportSpecifier,
+  isTypeOnlyImportDeclaration,
+  isTypeOnlyImportSpecifier,
+} from "./javascriptModuleDeclaration.js";
+
+/** Whether this child and its descendants contribute no JavaScript value. */
+export const isErasedJavaScriptValueChild = (
+  node: t.Node,
+  parent: t.Node | null,
+): boolean => {
+  if (
+    isErasedJavaScriptDeclaration(node) ||
+    t.isTSType(node) ||
+    t.isTSTypeElement(node) ||
+    t.isTSDeclareMethod(node) ||
+    t.isTSTypeAnnotation(node) ||
+    t.isTSTypeParameterDeclaration(node) ||
+    t.isTSTypeParameterInstantiation(node) ||
+    t.isTSClassImplements(node) ||
+    t.isTSInterfaceHeritage(node) ||
+    t.isTSInterfaceBody(node) ||
+    (t.isImportDeclaration(node) && isTypeOnlyImportDeclaration(node)) ||
+    ((t.isExportNamedDeclaration(node) || t.isExportAllDeclaration(node)) &&
+      isTypeOnlyExportDeclaration(node)) ||
+    (t.isImportSpecifier(node) && isTypeOnlyImportSpecifier(node)) ||
+    (t.isExportSpecifier(node) && isTypeOnlyExportSpecifier(node)) ||
+    (t.isTSImportEqualsDeclaration(node) && node.importKind === "type")
+  )
+    return true;
+  // Undecorated declared or abstract fields erase their keys and annotations.
+  // Decorators and a decorated field's computed key may execute at definition.
+  return (
+    t.isClassProperty(parent) &&
+    (parent.declare === true || parent.abstract === true) &&
+    !t.isDecorator(node) &&
+    !(
+      node === parent.key &&
+      parent.computed === true &&
+      (parent.decorators?.length ?? 0) > 0
+    )
+  );
+};
 
 /**
- * Visit every Babel AST node in deterministic source-tree order.
+ * Visit Babel AST nodes in deterministic source-tree order, excluding skipped subtrees.
  *
  * `readAncestors` returns a snapshot during `enter`, outermost-first and
  * ending with the direct parent. Callers
@@ -15,8 +60,34 @@ export const traverseJavaScriptAst = (
   visitor: JavaScriptAstVisitor,
 ): void => completeSemanticSteps(traverseJavaScriptAstSteps(root, visitor));
 
+/** Visit only syntax retained as JavaScript values after TypeScript erasure. */
+export const traverseJavaScriptValueAst = (
+  root: t.Node,
+  erasedSyntaxNodes: WeakSet<t.Node>,
+  visitor: JavaScriptAstVisitor,
+): void =>
+  completeSemanticSteps(
+    traverseJavaScriptValueAstSteps(root, erasedSyntaxNodes, visitor),
+  );
+
+/** Cooperative value-only view of the same deterministic AST traversal. */
+export function* traverseJavaScriptValueAstSteps(
+  root: t.Node,
+  erasedSyntaxNodes: WeakSet<t.Node>,
+  visitor: JavaScriptAstVisitor,
+): Generator<void, void> {
+  if (erasedSyntaxNodes.has(root)) return;
+  yield* traverseJavaScriptAstSteps(root, {
+    ...visitor,
+    skip: (node) =>
+      erasedSyntaxNodes.has(node) || visitor.skip?.(node) === true,
+  });
+}
+
 /** Callbacks for one deterministic AST traversal. */
 export interface JavaScriptAstVisitor {
+  /** Omit a child and its subtree without entering or exiting it. */
+  readonly skip?: (node: t.Node) => boolean;
   readonly enter: (
     node: t.Node,
     parent: t.Node | null,
@@ -50,6 +121,7 @@ export function* traverseJavaScriptAstSteps(
       current.nextIndex += 1;
       if (visited % 1024 === 0) yield;
       visited += 1;
+      if (visitor.skip?.(child) === true) continue;
       pending.push(enter(child, current.node));
     } else {
       visitor.exit?.(current.node, current.parent);
@@ -82,8 +154,7 @@ interface TraversalFrame {
  * not be reintroduced (they diverge on loc/comment fields and ordering).
  */
 export const childNodes = (node: t.Node): t.Node[] => {
-  const keys = t.VISITOR_KEYS[node.type];
-  if (keys === undefined) return [];
+  const keys = javaScriptAstChildKeys(node);
   const children: t.Node[] = [];
   for (const key of keys) {
     const value: unknown = Reflect.get(node, key);
@@ -98,3 +169,7 @@ export const childNodes = (node: t.Node): t.Node[] => {
   }
   return children;
 };
+
+/** Child-bearing fields; shared by traversal and structural AST comparison. */
+export const javaScriptAstChildKeys = (node: t.Node): readonly string[] =>
+  t.VISITOR_KEYS[node.type] ?? [];

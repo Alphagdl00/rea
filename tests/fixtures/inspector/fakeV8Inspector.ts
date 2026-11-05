@@ -10,6 +10,7 @@ interface InspectorCommand {
 
 interface FakeV8InspectorOptions {
   readonly targetUrl: string;
+  readonly attached?: unknown;
   readonly targetType?: "node" | "page";
   readonly runtimeProduct?: string;
   readonly scriptUrls?: readonly string[];
@@ -27,6 +28,7 @@ interface FakeV8InspectorOptions {
   readonly additionalTargetUrl?: string;
   readonly additionalTargetCount?: number;
   readonly closeOnMethod?: string;
+  readonly hangOnMethod?: string;
 }
 
 export interface FakeV8Inspector {
@@ -46,6 +48,9 @@ export const startFakeV8Inspector = async (
   const sockets = new Set<WebSocket>();
   let port = 0;
   const http = createServer((request, response) => {
+    // The in-process client may block on schema validation past the idle socket
+    // deadline. Keep discovery independent of pooled-socket expiry races.
+    response.setHeader("connection", "close");
     response.setHeader("content-type", "application/json");
     if (request.url === "/json/version") {
       response.end(
@@ -60,21 +65,19 @@ export const startFakeV8Inspector = async (
     if (request.url === "/json/list") {
       response.end(
         JSON.stringify([
-          target(
-            targetId,
-            options.targetUrl,
-            options.targetType ?? "node",
+          target(targetId, options.targetUrl, {
+            type: options.targetType ?? "node",
             port,
-          ),
+            attached: options.attached,
+          }),
           ...(options.additionalTargetUrl === undefined
             ? []
             : [
-                target(
-                  otherTargetId,
-                  options.additionalTargetUrl,
-                  options.targetType ?? "node",
+                target(otherTargetId, options.additionalTargetUrl, {
+                  type: options.targetType ?? "node",
                   port,
-                ),
+                  attached: options.attached,
+                }),
               ]),
           ...Array.from(
             { length: options.additionalTargetCount ?? 0 },
@@ -82,8 +85,11 @@ export const startFakeV8Inspector = async (
               target(
                 `00000000-0000-4000-8000-${String(index + 3).padStart(12, "0")}`,
                 options.targetUrl,
-                options.targetType ?? "node",
-                port,
+                {
+                  type: options.targetType ?? "node",
+                  port,
+                  attached: options.attached,
+                },
               ),
           ),
         ]),
@@ -145,8 +151,9 @@ const registerInspectorSocket = (
       socket.close();
       return;
     }
-    socket.send(JSON.stringify({ id: command.id, result: {} }));
+    if (options.hangOnMethod === command.method) return;
     respondToInspectorCommand(socket, command, options);
+    socket.send(JSON.stringify({ id: command.id, result: {} }));
   });
 };
 
@@ -220,15 +227,18 @@ const sendScriptEvents = (
 const target = (
   id: string,
   url: string,
-  type: "node" | "page",
-  port: number,
+  options: {
+    readonly type: "node" | "page";
+    readonly port: number;
+    readonly attached: unknown;
+  },
 ) => ({
   id,
-  type,
+  type: options.type,
   title: "redacted-by-provider",
   url,
-  attached: false,
-  webSocketDebuggerUrl: `ws://localhost:${String(port)}/${id}`,
+  ...(options.attached === undefined ? {} : { attached: options.attached }),
+  webSocketDebuggerUrl: `ws://localhost:${String(options.port)}/${id}`,
 });
 
 const parseCommand = (raw: string): InspectorCommand => {

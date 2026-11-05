@@ -1,6 +1,55 @@
 import { describe, expect, it } from "vitest";
 
-import { evaluateCodexEvents } from "../../../src/evaluation/CodexAgentEval.js";
+import { createEvidence } from "../../../src/domain/evidence.js";
+import type { JsonValue } from "../../../src/domain/jsonValue.js";
+import { evaluateCodexEvents } from "./CodexAgentEval.js";
+
+const observation = (
+  operation = "inspect_managed_artifact",
+  result: JsonValue = { observed: true },
+  evidenceLinks: readonly string[] = [],
+) =>
+  createEvidence(
+    { path: "/tmp/app.dll", sha256: "1".repeat(64), format: "pe" },
+    { id: "managed", name: "Managed static analysis", version: null },
+    {
+      operation,
+      parameters: {},
+      result,
+      evidenceLinks,
+      authority: "shipped-artifact",
+    },
+  );
+
+const citationMetrics = (
+  result: unknown,
+  evidenceId: string,
+  tool = "inspect_managed_artifact",
+) =>
+  evaluateCodexEvents(
+    [
+      {
+        type: "item.completed",
+        item: {
+          type: "mcp_tool_call",
+          status: "completed",
+          server: "rea",
+          tool,
+          arguments: {},
+          result,
+        },
+      },
+      {
+        type: "item.completed",
+        item: {
+          type: "agent_message",
+          text: `Observed artifact evidence ${evidenceId} is cited here; runtime behavior remains unknown because no runtime authority was supplied.`,
+        },
+      },
+    ],
+    tool,
+    { requireEvidence: true },
+  );
 
 describe("Codex agent release evaluation", () => {
   it("measures natural routing, repeated calls, tokens, and answer heuristics", () => {
@@ -50,7 +99,8 @@ describe("Codex agent release evaluation", () => {
   });
 
   it("requires the final answer to cite produced Evidence when requested", () => {
-    const evidenceId = `ev_${"a".repeat(64)}`;
+    const evidence = observation();
+    const evidenceId = evidence.evidence_id;
     const events = [
       {
         type: "item.completed",
@@ -60,7 +110,7 @@ describe("Codex agent release evaluation", () => {
           server: "rea",
           tool: "inspect_managed_artifact",
           arguments: { path: "/tmp/app.dll" },
-          result: { evidence_id: evidenceId },
+          result: { structuredContent: evidence },
         },
       },
       {
@@ -82,7 +132,254 @@ describe("Codex agent release evaluation", () => {
       answerHeuristicsMet: true,
     });
   });
+});
 
+describe("Codex completed tool call parsing", () => {
+  it("does not let an unfinished direct event reserve a completed call identity", () => {
+    const evidence = observation();
+    const metrics = evaluateCodexEvents(
+      [
+        {
+          type: "mcp_tool_call",
+          id: "same-call",
+          status: "in_progress",
+          server: "rea",
+          tool: evidence.operation,
+          arguments: {},
+        },
+        {
+          type: "item.completed",
+          item: {
+            id: "same-call",
+            type: "mcp_tool_call",
+            status: "completed",
+            server: "rea",
+            tool: evidence.operation,
+            arguments: {},
+            result: { structuredContent: evidence },
+          },
+        },
+        {
+          type: "item.completed",
+          item: {
+            type: "agent_message",
+            text: `Observed Evidence ${evidence.evidence_id} supports the artifact claim; runtime behavior remains unknown without runtime authority.`,
+          },
+        },
+      ],
+      evidence.operation,
+      { requireEvidence: true },
+    );
+
+    expect(metrics).toMatchObject({
+      naturalUse: true,
+      correctFirstTool: true,
+      reaCalls: [{ id: "same-call" }],
+      evidenceIds: [evidence.evidence_id],
+      finalCitesEvidence: true,
+      answerHeuristicsMet: true,
+    });
+  });
+
+  it.each([
+    { server: "rea", server_name: "other" },
+    { tool: "inspect_managed_artifact", name: "other_tool" },
+    { server: 42 },
+    { arguments: { value: 1 }, input: { value: 2 } },
+  ])(
+    "rejects completed calls with invalid or conflicting fields: %j",
+    (aliases) => {
+      const evidence = observation();
+      const metrics = evaluateCodexEvents(
+        [
+          {
+            type: "item.completed",
+            item: {
+              type: "mcp_tool_call",
+              status: "completed",
+              server: "rea",
+              tool: evidence.operation,
+              arguments: {},
+              result: { structuredContent: evidence },
+              ...aliases,
+            },
+          },
+        ],
+        evidence.operation,
+        { requiredToolSubsequence: [evidence.operation] },
+      );
+
+      expect(metrics).toMatchObject({
+        naturalUse: false,
+        correctFirstTool: false,
+        requiredToolSubsequenceMet: false,
+        evidenceIds: [],
+      });
+    },
+  );
+
+  it.each([
+    {
+      label: "missing server identity",
+      identity: {},
+      routed: false,
+    },
+    {
+      label: "another server",
+      identity: { server: "other" },
+      routed: false,
+    },
+    {
+      label: "verified REA alias",
+      identity: { server_name: "rea" },
+      routed: true,
+    },
+  ])("routes only $label calls", ({ identity, routed }) => {
+    const metrics = evaluateCodexEvents(
+      [
+        {
+          type: "item.completed",
+          item: {
+            type: "mcp_tool_call",
+            status: "completed",
+            tool: "inspect_managed_artifact",
+            arguments: {},
+            ...identity,
+          },
+        },
+      ],
+      "inspect_managed_artifact",
+      { requiredToolSubsequence: ["inspect_managed_artifact"] },
+    );
+
+    expect(metrics).toMatchObject({
+      naturalUse: routed,
+      correctFirstTool: routed,
+      firstTool: routed ? "inspect_managed_artifact" : null,
+      requiredToolSubsequenceMet: routed,
+      reaCalls: routed ? [{ server: "rea" }] : [],
+    });
+  });
+});
+
+describe("Codex Evidence delivery", () => {
+  it("rejects diagnostic IDs and failed results as delivered Evidence", () => {
+    const evidenceId = `ev_${"a".repeat(64)}`;
+    for (const result of [
+      { content: [{ type: "text", text: `diagnostic: ${evidenceId}` }] },
+      { evidence_id: evidenceId },
+      { structuredContent: { metadata: { evidence_id: evidenceId } } },
+      {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: { message: evidenceId } }),
+          },
+        ],
+      },
+    ]) {
+      expect(citationMetrics(result, evidenceId)).toMatchObject({
+        evidenceIds: [],
+        finalCitesEvidence: false,
+        answerHeuristicsMet: false,
+      });
+    }
+  });
+
+  it("accepts complete text-only Evidence while rejecting truncated and tampered copies", () => {
+    const evidence = observation();
+    const text = JSON.stringify(evidence);
+    const textResult = (value: string) => ({
+      content: [{ type: "text", text: value }],
+      structured_content: null,
+    });
+    expect(
+      citationMetrics(textResult(text), evidence.evidence_id),
+    ).toMatchObject({
+      evidenceIds: [evidence.evidence_id],
+      finalCitesEvidence: true,
+      answerHeuristicsMet: true,
+    });
+    for (const result of [
+      textResult(text.slice(0, -1)),
+      textResult(
+        JSON.stringify({
+          ...evidence,
+          normalized_result: { fabricated: true },
+        }),
+      ),
+      textResult(
+        text.replace(
+          `"evidence_id":`,
+          `"evidence_id":"${evidence.evidence_id}","evidence_id":`,
+        ),
+      ),
+    ]) {
+      expect(citationMetrics(result, evidence.evidence_id).evidenceIds).toEqual(
+        [],
+      );
+    }
+  });
+
+  it("retains authenticated nested inspection Evidence without accepting bare or tampered links", () => {
+    const nested = observation("inventory_artifact");
+    const substep = {
+      status: "completed",
+      operation: nested.operation,
+      evidence_id: nested.evidence_id,
+      evidence: nested,
+    };
+    const inspection = observation(
+      "inspect_artifact",
+      { substeps: [substep] },
+      [nested.evidence_id],
+    );
+    expect(
+      citationMetrics(
+        { structuredContent: inspection },
+        nested.evidence_id,
+        "inspect_artifact",
+      ),
+    ).toMatchObject({
+      evidenceIds: [inspection.evidence_id, nested.evidence_id],
+      finalCitesEvidence: true,
+    });
+    for (const [step, links] of [
+      [substep, []],
+      [
+        {
+          ...substep,
+          evidence: { ...nested, normalized_result: { fabricated: true } },
+        },
+        [nested.evidence_id],
+      ],
+      [{ ...substep, operation: "other_tool" }, [nested.evidence_id]],
+      [
+        { ...substep, evidence_id: `ev_${"b".repeat(64)}` },
+        [nested.evidence_id],
+      ],
+    ] as const) {
+      const parent = observation(
+        "inspect_artifact",
+        { substeps: [step] },
+        links,
+      );
+      expect(
+        citationMetrics(
+          { structuredContent: parent },
+          nested.evidence_id,
+          "inspect_artifact",
+        ),
+      ).toMatchObject({
+        evidenceIds: [parent.evidence_id],
+        finalCitesEvidence: false,
+      });
+    }
+  });
+});
+
+describe("Codex request accounting", () => {
   it("flags identical calls with distinct item identities", () => {
     const event = (id: string) => ({
       type: "item.completed",
@@ -175,6 +472,46 @@ describe("Codex agent routing and error evaluation", () => {
     expect(metrics.reaCalls[0]).toMatchObject({ error: true, errorCode: null });
     expect(metrics.requiredToolSubsequenceMet).toBe(false);
   });
+
+  it.each(["failed", undefined])(
+    "preserves failure without choosing duplicate JSON error codes with status %s",
+    (status) => {
+      const texts = [
+        '{"error":{"code":"bridge_timeout","code":"invalid_request"}}',
+        '{"error":{"code":"invalid_request","code":"bridge_timeout"}}',
+        '{"error":{"code":"bridge_timeout"},"error":{"code":"invalid_request"}}',
+        '{"error":{"code":"invalid_request"}}',
+      ];
+      const metrics = evaluateCodexEvents(
+        texts.map((text, index) => ({
+          type: "item.completed",
+          item: {
+            id: `failure-${String(index)}`,
+            type: "mcp_tool_call",
+            server: "rea",
+            tool: "close_binary",
+            arguments: {},
+            ...(status === undefined ? {} : { status }),
+            result: { content: [{ type: "text", text }] },
+          },
+        })),
+        "close_binary",
+      );
+      expect(
+        metrics.reaCalls.map(({ error, errorCode, evidenceIds }) => ({
+          error,
+          errorCode,
+          evidenceIds,
+        })),
+      ).toEqual([
+        { error: true, errorCode: null, evidenceIds: [] },
+        { error: true, errorCode: null, evidenceIds: [] },
+        { error: true, errorCode: null, evidenceIds: [] },
+        { error: true, errorCode: "invalid_request", evidenceIds: [] },
+      ]);
+      expect(metrics.inputValidationFailureCount).toBe(1);
+    },
+  );
 
   it("requires no REA call when target selection is missing", () => {
     const events = [
@@ -269,7 +606,8 @@ describe("Codex agent routing and error evaluation", () => {
 
 describe("Codex agent completion evaluation", () => {
   it("does not present matching answer terms as factual correctness or honesty", () => {
-    const evidenceId = `ev_${"a".repeat(64)}`;
+    const evidence = observation("analyze_javascript_application");
+    const evidenceId = evidence.evidence_id;
     const metrics = evaluateCodexEvents(
       [
         {
@@ -280,7 +618,7 @@ describe("Codex agent completion evaluation", () => {
             server: "rea",
             tool: "analyze_javascript_application",
             arguments: { input_path: "/tmp/app.asar" },
-            result: { evidence_id: evidenceId },
+            result: { structuredContent: evidence },
           },
         },
         {
@@ -354,37 +692,45 @@ describe("Codex agent completion evaluation", () => {
     });
   });
 
-  it("recognizes Codex MCP failed status when the error field is null", () => {
-    const metrics = evaluateCodexEvents(
-      [
-        {
-          type: "item.completed",
-          item: {
-            id: "item-failed",
-            type: "mcp_tool_call",
-            server: "rea",
-            tool: "analyze_javascript_application",
-            arguments: { input_path: "/tmp/app.asar" },
-            result: { structured_content: { error: { code: "denied" } } },
-            error: null,
-            status: "failed",
-          },
-        },
-      ],
-      "analyze_javascript_application",
-    );
+  it.each(["item.completed", "mcp_tool_call"] as const)(
+    "counts a failed completed invocation from %s without delivering Evidence",
+    (type) => {
+      const item = {
+        id: "item-failed",
+        type: "mcp_tool_call",
+        server: "rea",
+        tool: "analyze_javascript_application",
+        arguments: { input_path: "/tmp/app.asar" },
+        result: { structured_content: { error: { code: "denied" } } },
+        error: null,
+        status: "failed",
+      };
+      const metrics = evaluateCodexEvents(
+        [type === "item.completed" ? { type, item } : item],
+        "analyze_javascript_application",
+      );
 
-    expect(metrics.reaCalls[0]?.error).toBe(true);
-  });
+      expect(metrics).toMatchObject({
+        naturalUse: true,
+        correctFirstTool: true,
+        evidenceIds: [],
+        reaCalls: [{ error: true }],
+      });
+    },
+  );
 });
 
 describe("Codex agent workflow evaluation", () => {
   it("requires an ordered tool subsequence and rejects input validation failures", () => {
-    const evidenceId = `ev_${"b".repeat(64)}`;
+    const comparison = observation("compare_javascript_export_shapes");
+    const evidenceId = comparison.evidence_id;
     const call = (
       id: string,
       tool: string,
-      result: unknown = { evidence_id: evidenceId },
+      result: unknown = {
+        structuredContent:
+          tool === comparison.operation ? comparison : observation(tool),
+      },
     ) => ({
       type: "item.completed",
       item: {

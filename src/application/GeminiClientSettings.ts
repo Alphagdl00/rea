@@ -1,10 +1,11 @@
-import { realpath } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { stripComments } from "jsonc-parser";
 import { z } from "zod";
 import { err, ok, type Result } from "../domain/result.js";
 import { PRODUCT_IDENTITY } from "../identity.js";
-import { npxRegistrationCommand } from "./ClientRegistrationIdentity.js";
+import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
+import { currentClientRegistrationCommand } from "./ClientRegistrationIdentity.js";
 import {
   clientConfigurationValuesEqual,
   clientRegistrationEntry,
@@ -61,6 +62,7 @@ const normalizedPath = async (
 const workspaceTrusted = async (
   settings: NonNullable<SetupClient["geminiSettings"]>,
   sources: readonly SettingsSource[],
+  resources?: ArtifactResourceScope,
 ): Promise<Result<boolean, ClientConfigurationFileError>> => {
   let enabled = true;
   for (const { path, document } of sources) {
@@ -70,7 +72,10 @@ const workspaceTrusted = async (
   }
   if (settings.trustOverride !== undefined) return ok(settings.trustOverride);
   if (!enabled) return ok(true);
-  const text = await readConfigurationText(settings.trustedFoldersPath);
+  const text = await readConfigurationText(
+    settings.trustedFoldersPath,
+    resources,
+  );
   if (!text.ok) return text;
   if (text.value === undefined) return ok(false);
   let rules: z.output<typeof trustRulesSchema>;
@@ -105,11 +110,15 @@ const workspaceTrusted = async (
   return ok(trusted);
 };
 
-/** Check effective Gemini scopes while preserving their authority and source identity. */
+/**
+ * Check Gemini scopes using the caller's user-file observation (undefined means absent).
+ * Other settings sources are read here; transaction owners supply fresh user facts.
+ */
 export const readClientPolicyBlock = async (
   client: SetupClient,
-  userDocument?: ClientConfigurationDocument,
+  userDocument: ClientConfigurationDocument | undefined,
   desiredRegistration?: unknown,
+  resources?: ArtifactResourceScope,
 ): Promise<Result<string | undefined, ClientConfigurationFileError>> => {
   if (client.name !== "gemini_cli" || client.geminiSettings === undefined)
     return ok(undefined);
@@ -122,9 +131,9 @@ export const readClientPolicyBlock = async (
     settings.systemPath,
   ]) {
     const parsed =
-      path === client.configPath && userDocument !== undefined
+      path === client.configPath
         ? ok(userDocument)
-        : await readConfigurationFile(path, "json");
+        : await readConfigurationFile(path, "json", resources);
     if (!parsed.ok) return parsed;
     if (parsed.value !== undefined)
       sources.push({ path, document: parsed.value });
@@ -143,12 +152,27 @@ export const readClientPolicyBlock = async (
       ".gemini",
       "settings.json",
     );
-    const document = await readConfigurationFile(path, "json");
-    if (!document.ok) return document;
-    if (document.value !== undefined) {
-      const trusted = await workspaceTrusted(settings, sources);
-      if (!trusted.ok) return trusted;
-      if (trusted.value) {
+    // Only ENOENT proves absence; preserve other metadata failures as unreadable.
+    const present = await stat(path).then(
+      () => ok(true),
+      (cause: unknown) =>
+        cause instanceof Error && "code" in cause && cause.code === "ENOENT"
+          ? ok(false)
+          : err({
+              kind: "unreadable" as const,
+              path,
+              detail: `Configuration ${path} could not be read: ${cause instanceof Error ? cause.message : String(cause)}`,
+            }),
+    );
+    if (!present.ok) return present;
+    const includeWorkspace = present.value
+      ? await workspaceTrusted(settings, sources, resources)
+      : ok(false);
+    if (!includeWorkspace.ok) return includeWorkspace;
+    if (includeWorkspace.value) {
+      const document = await readConfigurationFile(path, "json", resources);
+      if (!document.ok) return document;
+      if (document.value !== undefined) {
         const source = { path, document: document.value };
         const systemIndex = sources.findIndex(
           (item) => item.path === settings.systemPath,
@@ -187,7 +211,7 @@ export const readClientPolicyBlock = async (
   const desired =
     desiredRegistration ??
     userDocument?.servers[PRODUCT_IDENTITY.mcpServerKey] ??
-    clientRegistrationEntry("json", npxRegistrationCommand(), {});
+    clientRegistrationEntry("json", currentClientRegistrationCommand(), {});
   if (
     override !== undefined &&
     !clientConfigurationValuesEqual(

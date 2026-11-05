@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import * as t from "@babel/types";
+import { runtimeFunctionParameters } from "./javascriptAstValues.js";
 
 import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import type { JavaScriptSemanticCallAnalysis } from "./javascriptSemanticCalls.js";
@@ -73,7 +74,7 @@ export function* collectJavaScriptSemanticFingerprintsSteps(
     const node = state.callableNodesById.get(callable.callableId);
     if (node === undefined) continue;
     yield;
-    const syntax = yield* fingerprintSyntaxSteps(node, callable.callableId);
+    const syntax = yield* fingerprintSyntaxSteps(node);
     const promiseEffects = promiseEffectsByOwner.get(callable.callableId) ?? [];
     const eventEffects = eventEffectsByOwner.get(callable.callableId) ?? [];
     const timerEffects = timerEffectsByOwner.get(callable.callableId) ?? [];
@@ -164,27 +165,18 @@ interface FingerprintSyntax {
 
 function* fingerprintSyntaxSteps(
   root: t.Node,
-  targetCallableId: string,
 ): Generator<void, FingerprintSyntax> {
   const normalizedTokens: string[] = [];
   const controlFlowTokens: string[] = [];
   const literals: string[] = [];
-  const callableStack: string[] = [];
   yield* traverseJavaScriptAstSteps(root, {
+    skip: (node) => semanticCallableIdForNode(node) !== null,
     enter: (node, parent) => {
-      const callableId = semanticCallableIdForNode(node);
-      if (callableId !== null) callableStack.push(callableId);
-      if (callableStack.at(-1) !== targetCallableId) return;
       normalizedTokens.push(normalizedNodeToken(node, parent));
       const control = controlFlowToken(node);
       if (control !== null) controlFlowTokens.push(control);
       const literal = semanticLiteral(node);
       if (literal !== null) literals.push(literal);
-    },
-    exit: (node) => {
-      const callableId = semanticCallableIdForNode(node);
-      if (callableId !== null && callableStack.at(-1) === callableId)
-        callableStack.pop();
     },
   });
   return { normalizedTokens, controlFlowTokens, literals };
@@ -206,6 +198,8 @@ const normalizedNodeToken = (node: t.Node, parent: t.Node | null): string => {
     primitiveAttribute(node, "optional"),
     primitiveAttribute(node, "async"),
     primitiveAttribute(node, "generator"),
+    primitiveAttribute(node, "delegate"),
+    primitiveAttribute(node, "prefix"),
   ].filter((value): value is string => value !== null);
   return [node.type, ...attributes].join(":");
 };
@@ -258,6 +252,9 @@ const controlFlowToken = (node: t.Node): string | null => {
 };
 
 const semanticLiteral = (node: t.Node): string | null => {
+  // Babel retains directive escapes in value; decoding them would erase the
+  // distinction between a strict-mode directive and an escaped lookalike.
+  if (t.isDirectiveLiteral(node)) return `directive:${node.value}`;
   if (t.isStringLiteral(node)) return `string:${node.value}`;
   if (t.isNumericLiteral(node)) return `number:${String(node.value)}`;
   if (t.isBooleanLiteral(node)) return `boolean:${String(node.value)}`;
@@ -288,7 +285,7 @@ const relationShape = (
 ];
 
 const callableParameterArity = (node: t.Node): number =>
-  t.isFunction(node) ? node.params.length : 0;
+  t.isFunction(node) ? runtimeFunctionParameters(node).length : 0;
 
 const isAsyncCallable = (node: t.Node): boolean =>
   t.isFunction(node) && node.async;

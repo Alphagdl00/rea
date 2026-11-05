@@ -1,10 +1,11 @@
-import { mkdir, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
+import { readStableSymlinkTarget } from "../../../src/reference/ReferenceSourceReaderEntries.js";
 import { readReferenceSource } from "../../support/referenceSourceResourceScope.js";
 
 describe("readReferenceSource entries", () => {
@@ -89,6 +90,39 @@ describe("readReferenceSource entries", () => {
     );
   });
 
+  it("marks a symlink changed when its path is replaced during target observation", async () => {
+    const root = await createTestTempDirectory("rea-reference-symlink-race-");
+    const link = join(root, "source-link");
+    await symlink("original-target", link);
+    const expected = await lstat(link, { bigint: true });
+
+    const result = await readStableSymlinkTarget(
+      link,
+      "source-link",
+      expected,
+      undefined,
+      async () => {
+        await unlink(link);
+        await symlink("replacement-target", link);
+        return {
+          status: "read",
+          kind: "symlink",
+          path: "source-link",
+          target: "original-target",
+          targetState: "missing",
+        };
+      },
+    );
+
+    expect(result).toEqual({
+      status: "failed",
+      kind: "symlink",
+      path: "source-link",
+      code: "changed",
+      message: "Symbolic link changed while its target was read",
+    });
+  });
+
   it("reads a source file larger than the former 16 MiB ceiling", async () => {
     const root = await createTestTempDirectory("rea-reference-large-");
     const size = 16 * 1024 * 1024 + 1;
@@ -142,10 +176,13 @@ describe("readReferenceSource failures and exclusions", () => {
     });
 
     if (!result.ok) throw result.error;
-    expect(checked).toEqual([
-      ["ignored", "directory"],
-      ["kept", "file"],
-    ]);
+    expect(checked).toHaveLength(2);
+    expect(checked).toEqual(
+      expect.arrayContaining([
+        ["ignored", "directory"],
+        ["kept", "file"],
+      ]),
+    );
     expect(result.value.entries.map(({ path }) => path)).toEqual(["kept"]);
   });
 

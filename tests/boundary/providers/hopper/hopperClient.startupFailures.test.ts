@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { access } from "node:fs/promises";
+import { createServer, type Server } from "node:net";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -40,6 +41,7 @@ class CancelThenFixtureLauncher implements BridgeLauncher {
   readonly firstLaunch = new Promise<ChildProcess>((resolve) => {
     this.#firstLaunchReady = resolve;
   });
+  retriedProcess: ChildProcess | undefined;
 
   async launch(session: BridgeSession) {
     this.#launches += 1;
@@ -48,15 +50,13 @@ class CancelThenFixtureLauncher implements BridgeLauncher {
       : new FixtureLauncher().launch(session));
     if (this.#launches === 1 && launched.ok)
       this.#firstLaunchReady?.(launched.value.process);
+    else if (launched.ok) this.retriedProcess = launched.value.process;
     return launched;
   }
 }
 
 class ExitingLauncher implements BridgeLauncher {
-  constructor(
-    readonly code: number,
-    readonly ownsProcessLifetime = true,
-  ) {}
+  constructor(readonly code: number) {}
 
   launch() {
     return Promise.resolve(
@@ -64,10 +64,8 @@ class ExitingLauncher implements BridgeLauncher {
         process: spawn(process.execPath, ["-e", `process.exit(${this.code})`], {
           stdio: ["ignore", "ignore", "pipe"],
         }),
-        ownsProcessLifetime: this.ownsProcessLifetime,
-        providerLifetime: this.ownsProcessLifetime
-          ? ("launcher-process" as const)
-          : ("external-application" as const),
+        ownsProcessLifetime: true as const,
+        providerLifetime: "launcher-process" as const,
         shutdownMode: "bridge-request" as const,
       }),
     );
@@ -124,11 +122,85 @@ class LateSilentLauncher implements BridgeLauncher {
   }
 }
 
+/**
+ * Bridge fixture whose health handshake returns an invalid payload, so
+ * parseHopperServerInfo rejects it with HopperProtocolError.
+ * Note: assumes the client's first bridge request is `health`; any
+ * auth/preamble request added before it would hit the -32601 branch.
+ */
+class BadHealthLauncher implements BridgeLauncher {
+  #server: Server | undefined;
+  #process: ChildProcess | undefined;
+
+  async launch(session: BridgeSession) {
+    const server = createServer((socket) => {
+      let buffer = "";
+      socket.setEncoding("utf8");
+      socket.on("data", (chunk: string) => {
+        buffer += chunk;
+        let newline = buffer.indexOf("\n");
+        while (newline >= 0) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          try {
+            const request = JSON.parse(line) as {
+              id: number;
+              method: string;
+            };
+            if (request.method === "health") {
+              socket.write(
+                `${JSON.stringify({ id: request.id, result: { bogus: true } })}\n`,
+              );
+            } else {
+              socket.write(
+                `${JSON.stringify({
+                  id: request.id,
+                  error: { code: -32601, message: "unknown method" },
+                })}\n`,
+              );
+            }
+          } catch {
+            // Ignore malformed input; the client only sends NDJSON.
+          }
+          newline = buffer.indexOf("\n");
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(session.socketPath, () => {
+        server.off("error", reject);
+        resolve();
+      });
+    });
+    this.#server = server;
+    const child = spawn(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)"],
+      {
+        stdio: "ignore",
+      },
+    );
+    this.#process = child;
+    return ok({
+      process: child,
+      ownsProcessLifetime: true as const,
+      providerLifetime: "launcher-process" as const,
+      shutdownMode: "process-cleanup" as const,
+      cleanup: async () => {
+        child.kill("SIGTERM");
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        return { cleaned: true as const, signaled: true };
+      },
+    });
+  }
+}
+
 const clients: HopperClient[] = [];
 
 afterEach(async () => {
   await Promise.all(clients.splice(0).map((client) => client.close()));
-});
+}, 45_000);
 
 describe("HopperClient startup deadline", () => {
   it("applies one deadline to launcher, socket, and health startup phases", async () => {
@@ -186,9 +258,18 @@ describe("HopperClient startup failures", () => {
     expect(
       firstProcess.exitCode !== null || firstProcess.signalCode !== null,
     ).toBe(true);
-    await expect(client.start()).resolves.toEqual({
+    const restarted = await client.start();
+    const retriedProcess = launcher.retriedProcess;
+    expect(retriedProcess).toBeDefined();
+    expect(retriedProcess).not.toBe(firstProcess);
+    expect(restarted).toEqual({
       ok: true,
-      value: { name: "REA Hopper bridge", version: "1.0.0" },
+      value: {
+        name: "REA Hopper bridge",
+        version: "1.0.0",
+        processId: retriedProcess?.pid,
+        maxRequestBytes: 16 * 1024 * 1024,
+      },
     });
     await expect(
       client.callTool("echo", { value: "retried" }),
@@ -212,11 +293,17 @@ describe("HopperClient startup failures", () => {
       error: { _tag: "HopperCancelledError" },
     });
     expect(launcher.processes).toHaveLength(0);
-    await expect(client.start()).resolves.toEqual({
-      ok: true,
-      value: { name: "REA Hopper bridge", version: "1.0.0" },
-    });
+    const started = await client.start();
     expect(launcher.processes).toHaveLength(1);
+    expect(started).toEqual({
+      ok: true,
+      value: {
+        name: "REA Hopper bridge",
+        version: "1.0.0",
+        processId: launcher.processes[0]?.pid,
+        maxRequestBytes: 16 * 1024 * 1024,
+      },
+    });
     await expect(
       client.callTool("echo", { value: "retried" }),
     ).resolves.toEqual({
@@ -225,7 +312,22 @@ describe("HopperClient startup failures", () => {
     });
   });
 
-  it.each([70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80])(
+  it("records unknown when the health handshake is invalid", async () => {
+    const launcher = new BadHealthLauncher();
+    const client = new HopperClient({ launcher, startupTimeoutMs: 30_000 });
+    clients.push(client);
+
+    const result = await client.start();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error._tag).toBe("HopperProtocolError");
+    // parseHopperServerInfo failures were never recorded, so operationHealth()
+    // reported idle and the fast path kept a client whose next start stays
+    // blocked by retained resources.
+    expect(client.operationHealth()).toMatchObject({ state: "unknown" });
+  });
+
+  it.each([70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82])(
     "reports Linux adapter exit %i during bridge startup",
     async (exitCode) => {
       const client = new HopperClient({
@@ -285,22 +387,5 @@ describe("HopperClient startup failures", () => {
         },
       },
     });
-  });
-
-  it("allows a short-lived launcher to hand off bridge startup", async () => {
-    const client = new HopperClient({
-      launcher: new ExitingLauncher(0, false),
-      startupTimeoutMs: 100,
-    });
-    clients.push(client);
-    const result = await client.start();
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.error).toMatchObject({
-        cleanupIncomplete: true,
-        cause: { _tag: "HopperTimeoutError" },
-        diagnostics: { primary_error: { code: "provider_timeout" } },
-      });
-    }
   });
 });

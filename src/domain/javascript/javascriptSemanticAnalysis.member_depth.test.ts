@@ -39,7 +39,7 @@ it("preserves a 12,000-member native import through both analyzers", () => {
   ]);
 });
 
-it("retains a deep CommonJS re-export path without inventing dynamic module links", () => {
+it("retains deep CommonJS paths and dependencies without inventing dynamic bindings", () => {
   const ir = analyzeJavaScriptSemantics(`
     module.exports.result = require("./dependency.js")${ordinaryMemberChain}.last;
     const dynamic = require("./other.js")${ordinaryMemberChain}[key].last;
@@ -50,6 +50,13 @@ it("retains a deep CommonJS re-export path without inventing dynamic module link
       specifier: "./dependency.js",
       importedName: "last",
       exportedName: "result",
+    }),
+    expect.objectContaining({
+      kind: "require",
+      specifier: "./other.js",
+      importedName: null,
+      localName: null,
+      exportedName: null,
     }),
   ]);
   expect(onlyBinding(ir, "dynamic").provenance).toMatchObject({
@@ -127,11 +134,19 @@ it("keeps a shadowed require local through a deep member initializer", () => {
 
 it.each([
   ["root.first.last()", "root.first.last"],
+  ["root[`first`].last()", "root.first.last"],
+  ['root["first" as const].last()', "root.first.last"],
   ['root[""].last()', "root..last"],
+  ["root[``].last()", "root..last"],
+  ['root["" as const].last()', "root..last"],
   ['("")[""].last()', "last"],
   ['("")[""]()', ""],
   ["root[0].last()", "root.0.last"],
+  ["root[0x1n].last()", "root.1.last"],
+  ["root[-1n].last()", "root.-1.last"],
   ["root[key].last()", "root.[computed@5].last"],
+  ["root[`first${key}`].last()", "root.[computed@5].last"],
+  ["root[`\\unicode`].last()", "root.[computed@5].last"],
   ["root?.first.last()", "root.first.last"],
   [`root${ordinaryMemberChain}.last()`, `root${ordinaryMemberChain}.last`],
 ])("preserves exact callee syntax (case %#)", (source, expected) => {

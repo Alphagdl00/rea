@@ -2,7 +2,7 @@ import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/server";
-import { afterEach, expect } from "vitest";
+import { afterAll, expect, it, onTestFinished, vi } from "vitest";
 import { z } from "zod";
 
 import type { BinarySessionPort } from "../../../src/application/binary/BinarySessionPort.js";
@@ -14,11 +14,16 @@ import {
   TOOL_CONTRACTS,
   toolContract,
 } from "../../../src/contracts/toolContracts.js";
+import { expandToolAvailability } from "../../../src/contracts/toolOutputSchemaPrimitives.js";
 import { run } from "../../../src/main.js";
 import { createServer } from "../../../src/server/createServer.js";
 import { optionalObservationFactories } from "../../fixtures/optionalObservationProviders.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { mcpTest } from "../../support/mcp/mcpFixture.js";
+import { createMcpSchemaValidation } from "../../fixtures/mcpSchemaValidation.js";
+
+const schemaValidation = createMcpSchemaValidation();
+afterAll(() => schemaValidation.clear());
 
 const failedAdapters = [
   ["browserObservation", "list_browser_targets", "rea-cdp-browser"],
@@ -40,20 +45,14 @@ const failedAdapters = [
   ],
 ] as const;
 
-const resources: Array<() => Promise<void>> = [];
-afterEach(async () => {
-  for (const close of resources.splice(0).reverse()) await close();
-});
-
-const boot = async (factories: OptionalObservationFactories) => {
+const boot = async (
+  factories: OptionalObservationFactories,
+  configureServer?: (server: McpServer) => void,
+) => {
   const loaded = await loadOptionalObservationProviders(factories);
   let server: McpServer | undefined;
   let session: BinarySessionPort | undefined;
-  let shutdown: (() => void) | undefined;
-  let resolveClose: (() => void) | undefined;
-  const closed = new Promise<void>((resolve) => {
-    resolveClose = resolve;
-  });
+  let shutdown: (() => Promise<void>) | undefined;
   const output: string[] = [];
   const exitCodes: number[] = [];
   expect(
@@ -65,7 +64,7 @@ const boot = async (factories: OptionalObservationFactories) => {
           throw new Error("Expected a session-owned server source");
         session = source.session;
         // A configured policy cannot hide an actual adapter loading failure.
-        return createServer(source, {
+        const created = createServer(source, {
           ...options,
           availabilityPolicy: () => ({
             processCaptureEnabled: true,
@@ -76,22 +75,20 @@ const boot = async (factories: OptionalObservationFactories) => {
             v8InspectorObservationEnabled: true,
           }),
         });
+        configureServer?.(created);
+        return created;
       },
       serve: (factory) => {
         const created = factory({ era: "legacy" });
         if (!(created instanceof McpServer))
           throw new Error("Expected the production synchronous MCP factory");
         server = created;
-        return {
-          close: async () => {
-            await server?.close();
-            resolveClose?.();
-          },
-        };
+        return { close: () => Promise.resolve() };
       },
-      registerShutdown: (handler) => {
-        shutdown = handler;
-        return () => {};
+      registerShutdown: () => () => {},
+      captureShutdown: (close) => {
+        shutdown = close;
+        onTestFinished(close);
       },
       writeStderr: (message) => output.push(message),
       setExitCode: (code) => exitCodes.push(code),
@@ -100,14 +97,8 @@ const boot = async (factories: OptionalObservationFactories) => {
   expect(output).toEqual([]);
   if (server === undefined || session === undefined || shutdown === undefined)
     throw new Error("Runtime did not construct the MCP server and session");
-  const close = shutdown;
-  resources.push(async () => {
-    close();
-    await closed;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(exitCodes).toEqual([]);
-  });
-  return { server, session, loaded };
+  expect(exitCodes).toEqual([]);
+  return { server, session, loaded, shutdown };
 };
 
 mcpTest.for(failedAdapters)(
@@ -127,7 +118,11 @@ mcpTest.for(failedAdapters)(
     });
     for (const [peer] of failedAdapters)
       expect(connected.loaded[peer] !== undefined).toBe(peer !== port);
-    const client = await mcp.connect(connected.server);
+    const client = await mcp.connect(
+      connected.server,
+      undefined,
+      schemaValidation,
+    );
     const names = (await client.listTools()).tools.map(({ name }) => name);
     expect(new Set(names)).toEqual(
       new Set(TOOL_CONTRACTS.map(({ name }) => name)),
@@ -154,33 +149,37 @@ mcpTest.for(failedAdapters)(
       name: "binary_session",
       arguments: {},
     });
-    expect(status.structuredContent).toMatchObject({
-      result: {
-        tool_availability: expect.arrayContaining([
-          expect.objectContaining({
-            name: operation,
-            available: false,
-            reason: "provider_unavailable",
-            remediation: expect.stringContaining(failure),
-          }),
-          expect.objectContaining({
-            name: "analyze_javascript_application",
-            available: true,
-          }),
-          expect.objectContaining({
-            name: "reconcile_javascript_runtime",
-            available: true,
-          }),
-          expect.objectContaining({
-            name:
-              port === "electronActiveObservation"
-                ? "list_electron_targets"
-                : "capture_electron_scenario",
-            available: true,
-          }),
-        ]),
-      },
-    });
+    const sessionStatus = toolContract("binary_session").outputSchema.parse(
+      status.structuredContent,
+    );
+    const availability = expandToolAvailability(
+      sessionStatus.result.tool_availability,
+    );
+    expect(availability).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: operation,
+          available: false,
+          reason: "provider_unavailable",
+          remediation: expect.stringContaining(failure),
+        }),
+        expect.objectContaining({
+          name: "analyze_javascript_application",
+          available: true,
+        }),
+        expect.objectContaining({
+          name: "reconcile_javascript_runtime",
+          available: true,
+        }),
+        expect.objectContaining({
+          name:
+            port === "electronActiveObservation"
+              ? "list_electron_targets"
+              : "capture_electron_scenario",
+          available: true,
+        }),
+      ]),
+    );
     const healthy =
       port === "javascriptRuntimeObservation"
         ? "list_browser_targets"
@@ -230,6 +229,15 @@ mcpTest.for(failedAdapters)(
       arguments: { unexpected: true },
     });
     expect(malformed.isError).toBe(true);
+    expect(parseMcpToolError(malformed)).toMatchObject({
+      error: {
+        code: "invalid_request",
+        category: "invalid_input",
+        retryable: false,
+        recovery: { kind: "inspect_input_contract", operation },
+        details: { operation },
+      },
+    });
     expect(JSON.stringify(malformed)).not.toContain(failure);
   },
 );
@@ -247,7 +255,7 @@ mcpTest(
       electronActiveObservation: failed,
       javascriptRuntimeObservation: failed,
     });
-    const client = await mcp.connect(first.server);
+    const client = await mcp.connect(first.server, undefined, schemaValidation);
     expect((await client.listTools()).tools).toHaveLength(
       TOOL_CONTRACTS.length,
     );
@@ -262,3 +270,28 @@ mcpTest(
     expect(second.loaded.browserObservation).toBeDefined();
   },
 );
+
+it("reports a server close failure and retries the runtime owner", async () => {
+  const failure = new Error("controlled close failure");
+  let denied = true;
+  let close: ReturnType<typeof vi.fn> | undefined;
+  const connected = await boot(optionalObservationFactories([]), (server) => {
+    const realClose = server.close.bind(server);
+    close = vi.spyOn(server, "close").mockImplementation(async () => {
+      if (denied) throw failure;
+      await realClose();
+    });
+  });
+  try {
+    await expect(connected.shutdown()).rejects.toMatchObject({
+      errors: [failure],
+    });
+    expect(close).toHaveBeenCalledTimes(1);
+    denied = false;
+    await connected.shutdown();
+    await connected.shutdown();
+    expect(close).toHaveBeenCalledTimes(2);
+  } finally {
+    denied = false;
+  }
+});

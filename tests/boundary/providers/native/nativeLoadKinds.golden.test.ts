@@ -1,116 +1,64 @@
 import { expect, it } from "vitest";
+import { readMachoCommandNames } from "../../../../src/native/MachoCommandNames.js";
+import { projectMachoBinary } from "../../../../src/native/MachoBinaryProjection.js";
 
-import { NativeMacOSProvider } from "../../../../src/native/NativeMacOSProvider.js";
-import { parseOtoolLoadCommands } from "../../../../src/native/parsers/otool.js";
-import {
-  NativeFixtureRunner,
-  nativeMachoTarget,
-} from "../../../fixtures/nativeCommands.js";
-
-it("retains lazily loaded library dependencies", () => {
-  const load = parseOtoolLoadCommands(
-    [
-      "Load command 9",
-      "      cmd LC_LAZY_LOAD_DYLIB",
-      "      name /usr/lib/libLazy.dylib (offset 24)",
-      "   time stamp 2 Thu Jan  1 00:00:02 1970",
-      "      current version 1.0.0",
-      "compatibility version 1.0.0",
-      "",
-    ].join("\n"),
+it.each([
+  [1, "CLANG"],
+  [2, "SWIFT"],
+  [3, "LD"],
+  [4, "LLD"],
+  [1024, "METAL"],
+  [1025, "AIRLLD"],
+  [1026, "AIRNT"],
+  [1027, "AIRNT_PLUGIN"],
+  [1028, "AIRPACK"],
+  [1031, "GPUARCHIVER"],
+  [1032, "METAL_FRAMEWORK"],
+  [9999, "9999"],
+])("decodes binary build tool %i as %s", async (tool, expected) => {
+  const image = Buffer.alloc(64);
+  image.writeUInt32LE(0xfeedfacf, 0);
+  image.writeUInt32LE(0x0100000c, 4);
+  image.writeUInt32LE(1, 16);
+  image.writeUInt32LE(32, 20);
+  image.writeUInt32LE(0x32, 32);
+  image.writeUInt32LE(32, 36);
+  image.writeUInt32LE(1, 40);
+  image.writeUInt32LE(1, 52);
+  image.writeUInt32LE(tool, 56);
+  image.writeUInt32LE(0x00010203, 60);
+  const binary = await readMachoCommandNames(
+    async (offset, length) => image.subarray(offset, offset + length),
+    image.length,
+    1024,
+    2,
   );
-  expect(load.dependencies).toContainEqual({
-    path: "/usr/lib/libLazy.dylib",
-    kind: "LC_LAZY_LOAD_DYLIB",
-    current_version: "1.0.0",
-    compatibility_version: "1.0.0",
-  });
-});
-
-it("preserves dependency install names that begin with the word stamp", () => {
-  const load = parseOtoolLoadCommands(
-    [
-      "Load command 2",
-      "          cmd LC_LOAD_DYLIB",
-      "          name stamp plugin.dylib (offset 24)",
-      "   time stamp 2 Thu Jan  1 00:00:02 1970",
-      "      current version 1.0.0",
-      "compatibility version 1.0.0",
-      "",
-    ].join("\n"),
-  );
-  expect(load.dependencies).toContainEqual({
-    path: "stamp plugin.dylib",
-    kind: "LC_LOAD_DYLIB",
-    current_version: "1.0.0",
-    compatibility_version: "1.0.0",
-  });
-  expect(
-    load.commands.find((command) => command.kind === "LC_LOAD_DYLIB")?.fields[
-      "time stamp"
-    ],
-  ).toMatch(/^2 Thu Jan/);
-});
-
-it("normalizes legacy version-minimum commands into build metadata", () => {
-  const load = parseOtoolLoadCommands(
-    [
-      "Load command 3",
-      "      cmd LC_VERSION_MIN_MACOSX",
-      "    version 10.13",
-      "        sdk 10.15",
-      "Load command 4",
-      "      cmd LC_VERSION_MIN_IPHONEOS",
-      "    version 12.0",
-      "        sdk 12.1",
-      "Load command 5",
-      "      cmd LC_SOURCE_VERSION",
-      "    version 1.2.3",
-      "",
-    ].join("\n"),
-  );
-  expect(load.builds).toEqual([
-    {
-      platform: "MACOSX",
-      minimum_os: "10.13",
-      sdk: "10.15",
-      tools: [],
-    },
-    {
-      platform: "IPHONEOS",
-      minimum_os: "12.0",
-      sdk: "12.1",
-      tools: [],
-    },
+  expect(projectMachoBinary(binary).builds[0]?.tools).toEqual([
+    { name: expected, version: "1.2.3" },
   ]);
 });
 
-it("limits thread-state entrypoints instead of reporting none silently", async () => {
-  const runner = new NativeFixtureRunner({
-    "otool:-h": [
-      "Load command 0",
-      "      cmd LC_UNIXTHREAD",
-      "      flavor 1",
-      "      count 1",
-      "",
-    ].join("\n"),
-  });
-  const client = new NativeMacOSProvider({}, runner, "darwin").createClient(
-    nativeMachoTarget("/owned/legacy-fixture"),
-  );
-  const result = await client.execute("inspect_macho", {});
-  if (!result.ok) throw result.error;
-  expect(result.value.result).toMatchObject({
-    entrypoints: {
-      items: [],
-      total: null,
-      exhaustive: false,
-      limitations: [
-        "Thread-state entrypoints (LC_UNIXTHREAD/LC_THREAD) are retained as raw load commands; file offsets are not derived.",
-      ],
-    },
-  });
-  expect(result.value.limitations).toContain(
-    "Thread-state entrypoints (LC_UNIXTHREAD/LC_THREAD) are retained as raw load commands; file offsets are not derived.",
-  );
-});
+it.each([4, 5])(
+  "marks thread command %i entrypoints as unknown",
+  async (command) => {
+    const image = Buffer.alloc(48);
+    image.writeUInt32LE(0xfeedfacf, 0);
+    image.writeUInt32LE(0x0100000c, 4);
+    image.writeUInt32LE(1, 16);
+    image.writeUInt32LE(16, 20);
+    image.writeUInt32LE(command, 32);
+    image.writeUInt32LE(16, 36);
+    const binary = await readMachoCommandNames(
+      async (offset, length) => image.subarray(offset, offset + length),
+      image.length,
+      1024,
+      1,
+    );
+    const result = projectMachoBinary(binary);
+    expect(result.entrypoints).toEqual([]);
+    expect(result.entrypointLimitations).toEqual(
+      expect.arrayContaining([expect.stringContaining("Thread-state")]),
+    );
+    expect(result.commandLimitations.length).toBeGreaterThan(0);
+  },
+);

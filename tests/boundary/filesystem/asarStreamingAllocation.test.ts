@@ -9,11 +9,12 @@ import {
   writeFile,
   truncate,
 } from "node:fs/promises";
-import { join } from "node:path";
+import type { FileHandle } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import { buffer } from "node:stream/consumers";
 import { createPackageWithOptions } from "@electron/asar";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 import { scanArtifactInventory } from "../../fixtures/artifactInventory.js";
 import { AsarArtifactReader } from "../../../src/artifacts/AsarArtifactReader.js";
 import {
@@ -21,9 +22,13 @@ import {
   readValidatedAsarEntry,
 } from "../../../src/artifacts/AsarEntryStream.js";
 import { hashReadable } from "../../../src/artifacts/ArtifactHash.js";
+import { ARTIFACT_CLASSIFICATION_PREFIX_BYTES } from "../../../src/artifacts/ArtifactClassificationProbe.js";
+import { asarHeaderBytes } from "../../fixtures/asarHeader.js";
+import { readArtifactFileChunks } from "../../../src/artifacts/readArtifactFileChunks.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
 const memberBytes = 64 * 1024 * 1024;
+const maximumObservedChunkBytes = 1024 * 1024;
 const expectedSha256 = (): string => {
   const hash = createHash("sha256");
   const zeros = Buffer.alloc(64 * 1024);
@@ -104,7 +109,13 @@ describe("ASAR entry streaming", () => {
       await writeFile(join(source, "small.js"), "module.exports = 1;\n");
       await createPackageWithOptions(source, archive, {});
 
-      const reader = new AsarArtifactReader(archive);
+      let snapshotPath: string | undefined;
+      const reader = new AsarArtifactReader(archive, {
+        openFile: async (path, flags) => {
+          if (path !== archive) snapshotPath = path;
+          return openFile(path, flags);
+        },
+      });
 
       try {
         const entries = [];
@@ -114,9 +125,11 @@ describe("ASAR entry streaming", () => {
         const entry = entries.find(({ path }) => path === "small.js");
         if (entry === undefined) throw new Error("Expected packed ASAR member");
         const snapshot = await reader.openContainer();
-        const identity = await lstat(snapshot.path);
+        if (snapshotPath === undefined)
+          throw new Error("Expected snapshot acquisition");
+        const identity = await lstat(snapshotPath);
         await buffer(snapshot);
-        const probe = await openFile(snapshot.path, "r");
+        const probe = await openFile(snapshotPath, "r");
         expect(await matchingDescriptorCount(identity)).toBeGreaterThan(0);
         await probe.close();
         expect(await matchingDescriptorCount(identity)).toBe(0);
@@ -144,7 +157,13 @@ describe("ASAR entry streaming", () => {
       await writeFile(join(source, "small.js"), "module.exports = 1;\n");
       await createPackageWithOptions(source, archive, {});
 
-      const reader = new AsarArtifactReader(archive);
+      let snapshotPath: string | undefined;
+      const reader = new AsarArtifactReader(archive, {
+        openFile: async (path, flags) => {
+          if (path !== archive) snapshotPath = path;
+          return openFile(path, flags);
+        },
+      });
 
       try {
         const entries = [];
@@ -152,7 +171,9 @@ describe("ASAR entry streaming", () => {
         const entry = entries.find(({ path }) => path === "small.js");
         if (entry === undefined) throw new Error("Expected packed ASAR member");
         const snapshot = await reader.openContainer();
-        const identity = await lstat(snapshot.path);
+        if (snapshotPath === undefined)
+          throw new Error("Expected snapshot acquisition");
+        const identity = await lstat(snapshotPath);
         await buffer(snapshot);
         const controller = new AbortController();
         const opening = reader.open(entry, controller.signal);
@@ -339,23 +360,25 @@ describe("ASAR read failures", () => {
         syscall: "close",
       });
       let closeCount = 0;
-      const reader = new AsarArtifactReader(archive, async (path, flags) => {
-        const handle = await openFile(path, flags);
-        expect(await matchingDescriptorCount(identity)).toBeGreaterThan(0);
-        return {
-          get fd() {
-            return handle.fd;
-          },
-          async stat() {
-            throw ioError;
-          },
-          async close() {
-            closeCount += 1;
-            if (closeCount === 1) throw closeError;
-            await handle.close();
-          },
-          read: handle.read.bind(handle),
-        };
+      const reader = new AsarArtifactReader(archive, {
+        openUnpackedFile: async (path, flags) => {
+          const handle = await openFile(path, flags);
+          expect(await matchingDescriptorCount(identity)).toBeGreaterThan(0);
+          return {
+            get fd() {
+              return handle.fd;
+            },
+            async stat() {
+              throw ioError;
+            },
+            async close() {
+              closeCount += 1;
+              if (closeCount === 1) throw closeError;
+              await handle.close();
+            },
+            read: handle.read.bind(handle),
+          };
+        },
       });
 
       try {
@@ -395,24 +418,37 @@ it.skipIf(process.platform === "win32")(
     });
     const closeFailure = new Error("native close outcome unavailable");
     let closeCount = 0;
-    const reader = new AsarArtifactReader(archive, async (path, flags) => {
-      const handle = await openFile(path, flags);
-      return {
-        get fd() {
-          return handle.fd;
-        },
-        async stat() {
-          throw statFailure;
-        },
-        async close() {
-          closeCount += 1;
-          // Model Node's invalidated-descriptor rejection without leaking a
-          // native descriptor in the test process.
-          await handle.close();
-          throw closeFailure;
-        },
-        read: handle.read.bind(handle),
-      };
+    let snapshotRoot: string | undefined;
+    const reader = new AsarArtifactReader(archive, {
+      openFile: async (path, flags) => {
+        if (path !== archive && snapshotRoot === undefined) {
+          const root = dirname(path);
+          snapshotRoot = root;
+          // This fixture deliberately reports an unrecoverable close outcome.
+          // Remove its retained snapshot only after testing reader ownership.
+          onTestFinished(() => rm(root, { recursive: true, force: true }));
+        }
+        return openFile(path, flags);
+      },
+      openUnpackedFile: async (path, flags) => {
+        const handle = await openFile(path, flags);
+        return {
+          get fd() {
+            return handle.fd;
+          },
+          async stat() {
+            throw statFailure;
+          },
+          async close() {
+            closeCount += 1;
+            // Model Node's invalidated-descriptor rejection without leaking a
+            // native descriptor in the test process.
+            await handle.close();
+            throw closeFailure;
+          },
+          read: handle.read.bind(handle),
+        };
+      },
     });
     const entry = await unpackedMember(reader);
     await expect(reader.open(entry)).rejects.toMatchObject({
@@ -429,6 +465,8 @@ it.skipIf(process.platform === "win32")(
       });
     expect(closeCount).toBe(1);
     await waitForNoMatchingDescriptor(identity);
+    if (snapshotRoot === undefined) throw new Error("Expected ASAR snapshot");
+    expect((await lstat(snapshotRoot)).isDirectory()).toBe(true);
   },
 );
 
@@ -438,24 +476,26 @@ it.skipIf(process.platform === "win32")(
     const { archive, unpackedPath, identity } = await createUnpackedFixture();
     const controller = new AbortController();
     let closeCount = 0;
-    const reader = new AsarArtifactReader(archive, async (path, flags) => {
-      const handle = await openFile(path, flags);
-      return {
-        get fd() {
-          return handle.fd;
-        },
-        async stat() {
-          const observed = await handle.stat();
-          controller.abort();
-          return observed;
-        },
-        async close() {
-          closeCount += 1;
-          if (closeCount === 1) throw new Error("first close failed");
-          await handle.close();
-        },
-        read: handle.read.bind(handle),
-      };
+    const reader = new AsarArtifactReader(archive, {
+      openUnpackedFile: async (path, flags) => {
+        const handle = await openFile(path, flags);
+        return {
+          get fd() {
+            return handle.fd;
+          },
+          async stat() {
+            const observed = await handle.stat();
+            controller.abort();
+            return observed;
+          },
+          async close() {
+            closeCount += 1;
+            if (closeCount === 1) throw new Error("first close failed");
+            await handle.close();
+          },
+          read: handle.read.bind(handle),
+        };
+      },
     });
 
     try {
@@ -483,25 +523,27 @@ it.skipIf(process.platform === "win32")(
     const { archive, unpackedPath, identity } = await createUnpackedFixture();
     const closeError = new Error("first close failed");
     let closeCount = 0;
-    const reader = new AsarArtifactReader(archive, async (path, flags) => {
-      const handle = await openFile(path, flags);
-      return {
-        get fd() {
-          return handle.fd;
-        },
-        async stat() {
-          const observed = await handle.stat();
-          return Object.assign(Object.create(observed), {
-            ino: observed.ino + 1,
-          });
-        },
-        async close() {
-          closeCount += 1;
-          if (closeCount === 1) throw closeError;
-          await handle.close();
-        },
-        read: handle.read.bind(handle),
-      };
+    const reader = new AsarArtifactReader(archive, {
+      openUnpackedFile: async (path, flags) => {
+        const handle = await openFile(path, flags);
+        return {
+          get fd() {
+            return handle.fd;
+          },
+          async stat() {
+            const observed = await handle.stat();
+            return Object.assign(Object.create(observed), {
+              ino: observed.ino + 1,
+            });
+          },
+          async close() {
+            closeCount += 1;
+            if (closeCount === 1) throw closeError;
+            await handle.close();
+          },
+          read: handle.read.bind(handle),
+        };
+      },
     });
 
     try {
@@ -526,16 +568,15 @@ it.skipIf(process.platform === "win32")(
 );
 
 it.skipIf(process.platform === "win32")(
-  "retains unpacked handles and snapshots across combined cleanup failures",
+  "retains unpacked handles before retrying snapshot cleanup failures",
   async () => {
     const { archive, unpackedPath, identity } = await createUnpackedFixture();
     const closeError = new Error("unpacked close denied");
     const snapshotError = new Error("snapshot removal denied");
     let closeCount = 0;
     const snapshotPaths: string[] = [];
-    const reader = new AsarArtifactReader(
-      archive,
-      async (path, flags) => {
+    const reader = new AsarArtifactReader(archive, {
+      openUnpackedFile: async (path, flags) => {
         const handle = await openFile(path, flags);
         return {
           get fd() {
@@ -556,12 +597,12 @@ it.skipIf(process.platform === "win32")(
           read: handle.read.bind(handle),
         };
       },
-      async (path) => {
+      removeSnapshot: async (path) => {
         snapshotPaths.push(path);
         if (snapshotPaths.length === 1) throw snapshotError;
         await rm(path, { recursive: true, force: true });
       },
-    );
+    });
 
     try {
       const entry = await unpackedMember(reader);
@@ -578,19 +619,24 @@ it.skipIf(process.platform === "win32")(
       );
       expect(cleanupFailure).toMatchObject({
         cleanup: {
-          resources: [unpackedPath, expect.any(String)],
+          resources: [unpackedPath],
           reason: expect.stringContaining("unpacked close denied"),
         },
       });
+      expect(closeCount).toBe(2);
+      expect(snapshotPaths).toEqual([]);
+      expect(await matchingDescriptorCount(identity)).toBeGreaterThan(0);
+
+      await expect(reader.close()).rejects.toMatchObject({
+        message: snapshotError.message,
+        cleanup: { resources: [expect.any(String)] },
+      });
+      expect(closeCount).toBe(3);
+      await waitForNoMatchingDescriptor(identity);
       const snapshotRoot = snapshotPaths[0];
       if (snapshotRoot === undefined)
         throw new Error("Expected owned ASAR snapshot root");
       expect(snapshotPaths).toEqual([snapshotRoot]);
-      expect(cleanupFailure).toMatchObject({
-        cleanup: { resources: [unpackedPath, snapshotRoot] },
-      });
-      expect(closeCount).toBe(2);
-      expect(await matchingDescriptorCount(identity)).toBeGreaterThan(0);
       expect((await lstat(snapshotRoot)).isDirectory()).toBe(true);
 
       await reader.close();
@@ -672,12 +718,15 @@ it("preserves filesystem errors raised while consuming a member stream", async (
     errno: -5,
     syscall: "read",
   });
-  const source = Readable.from(
-    (async function* () {
-      yield Buffer.from("partial");
-      throw ioError;
-    })(),
-  );
+  let delivered = false;
+  const read = (async (target: Buffer) => {
+    if (delivered) throw ioError;
+    delivered = true;
+    const partial = Buffer.from("partial");
+    partial.copy(target);
+    return { bytesRead: partial.length, buffer: target };
+  }) as FileHandle["read"];
+  const source = readArtifactFileChunks({ read });
   const output = readValidatedAsarEntry(
     source,
     undefined,
@@ -700,6 +749,29 @@ it("preserves filesystem errors raised while consuming a member stream", async (
 });
 
 describe("ASAR entry streaming", () => {
+  it("matches ASAR after a long JSON prefix without retaining it in the classification prefix", async () => {
+    const bytes = asarHeaderBytes(`${" ".repeat(9_000)}{"files":{}}`);
+    const observed = await hashReadable(
+      Readable.from(
+        (async function* () {
+          for (const byte of bytes) yield Buffer.of(byte);
+        })(),
+      ),
+    );
+
+    expect(observed.prefix).toHaveLength(ARTIFACT_CLASSIFICATION_PREFIX_BYTES);
+    expect(observed.asarHeader).toMatchObject({
+      state: "matched",
+      signatureOffset: 16 + 9_000,
+      extents: {
+        jsonBytes: Buffer.byteLength(`${" ".repeat(9_000)}{"files":{}}`),
+      },
+    });
+    expect(observed.sha256).toBe(
+      createHash("sha256").update(bytes).digest("hex"),
+    );
+  });
+
   it("reports the observed digest when an unpacked member changes size", async () => {
     const root = await createTestTempDirectory(
       "rea-asar-unpacked-size-change-",
@@ -727,7 +799,7 @@ describe("ASAR entry streaming", () => {
     ["packed", {}],
     ["unpacked", { unpack: "large.bin" }],
   ] as const)(
-    "opens a %s member without allocating its full contents",
+    "streams a %s member in bounded chunks with its complete digest",
     async (_kind, options) => {
       const root = await createTestTempDirectory("rea-asar-streaming-");
       const source = join(root, "source");
@@ -745,13 +817,21 @@ describe("ASAR entry streaming", () => {
         const entry = entries.find(({ path }) => path === "large.bin");
         if (entry === undefined) throw new Error("Expected large ASAR member");
 
-        const before = process.memoryUsage().arrayBuffers;
         const stream = await reader.open(entry);
-        const afterOpen = process.memoryUsage().arrayBuffers;
-        const observed = await hashReadable(stream);
-        const allocation = afterOpen - before;
+        let largestChunkBytes = 0;
+        const measuredStream = Readable.from(
+          (async function* () {
+            for await (const chunk of stream) {
+              largestChunkBytes = Math.max(largestChunkBytes, chunk.byteLength);
+              yield chunk;
+            }
+          })(),
+        );
+        const observed = await hashReadable(measuredStream);
 
-        expect(allocation).toBeLessThan(memberBytes / 2);
+        expect(largestChunkBytes).toBeLessThanOrEqual(
+          maximumObservedChunkBytes,
+        );
         expect(observed).toMatchObject({
           sha256: expectedSha256(),
           bytes: memberBytes,

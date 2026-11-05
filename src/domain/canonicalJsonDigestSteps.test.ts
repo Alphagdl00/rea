@@ -1,7 +1,10 @@
 import { fc, it } from "@fast-check/vitest";
 import { describe, expect } from "vitest";
 import { canonicalJsonDigestSteps } from "./canonicalJsonDigestSteps.js";
-import { digestCanonicalValue } from "./canonicalDigest.js";
+import {
+  CanonicalDigestError,
+  digestCanonicalValue,
+} from "./canonicalDigest.js";
 import { jsonValueSchema, type JsonValue } from "./jsonValue.js";
 
 const complete = <Value>(steps: Iterator<void, Value>): Value => {
@@ -21,6 +24,12 @@ describe("cooperative canonical JSON digest", () => {
     ),
     { payload: `${"x".repeat(8191)}𐀀${"\n\ud800".repeat(20_000)}` },
     { [`${"x".repeat(8191)}𐀀${"\n".repeat(20_000)}`]: "value" },
+    Object.fromEntries(
+      Array.from({ length: 512 }, (_, index) => [
+        `escaped\n"\\𐀀${"x".repeat(32)}${index}`,
+        { repeated: index },
+      ]),
+    ),
   ];
   it.each(values.map((value) => ({ value })))(
     "preserves complete canonical meaning (%#)",
@@ -55,12 +64,39 @@ describe("cooperative canonical JSON digest", () => {
     expect(steps.next().done).toBe(true);
   });
 
+  it("continues object hashing when a pending property is omitted", () => {
+    const value: { [key: string]: JsonValue } = {
+      a: "x".repeat(32_768),
+      b: 1,
+      c: { retained: true },
+    };
+    const steps = canonicalJsonDigestSteps(value);
+    expect(steps.next().done).toBe(false);
+    delete value.b;
+    expect(complete(steps)).toBe(digestCanonicalValue(value));
+  });
+
   it("rejects sparse arrays, nonfinite numbers and cycles", () => {
     const sparse: JsonValue[] = [];
     sparse.length = 2;
     const cycle: { [key: string]: JsonValue } = {};
     cycle.self = cycle;
-    for (const value of [sparse, Number.NaN, cycle])
-      expect(() => complete(canonicalJsonDigestSteps(value))).toThrow();
+    expect(() => complete(canonicalJsonDigestSteps(sparse))).toThrow();
+    expect(() => complete(canonicalJsonDigestSteps(Number.NaN))).toThrow(
+      CanonicalDigestError,
+    );
+    expect(() => complete(canonicalJsonDigestSteps(cycle))).toThrow(
+      CanonicalDigestError,
+    );
+    try {
+      complete(canonicalJsonDigestSteps(Number.NaN));
+    } catch (cause) {
+      expect(cause).toMatchObject({ code: "nan" });
+    }
+    try {
+      complete(canonicalJsonDigestSteps(cycle));
+    } catch (cause) {
+      expect(cause).toMatchObject({ code: "circular" });
+    }
   });
 });

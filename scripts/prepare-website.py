@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 from website import PageMetadata, page_url
+from website_agents import prepare_discovery, prepare_markdown
 
 
 EXAMPLE_FILES = (
@@ -76,9 +77,16 @@ def prepare_notes_example(site):
     print(f"Prepared examples/notes-example.zip ({len(EXAMPLE_FILES)} files).")
 
 
-if __name__ == "__main__":
-    root = Path(__file__).resolve().parent.parent
-    site = root / "website/public"
+def prepare_assets(site):
+    """Finish the shared publish artifact before it replaces the current preview."""
     prepare_sharing_image(site)
     prepare_sitemap(site)
     prepare_notes_example(site)
+    prepare_discovery(Path(__file__).resolve().parent.parent, site)
+    prepare_markdown(site)
+
+
+if __name__ == "__main__":
+    root = Path(__file__).resolve().parent.parent
+    from website_i18n import build_translations
+    build_translations(root, root / "website/_site", finalize=prepare_assets)

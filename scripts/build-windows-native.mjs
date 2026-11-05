@@ -6,12 +6,24 @@ import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { importVerifierSource } from "./lib/verifier-source-loader.mjs";
+
+const { WINDOWS_NATIVE_ARTIFACT, createWindowsNativeManifest } =
+  await importVerifierSource(
+    new URL("../src/domain/windowsNativeArtifact.ts", import.meta.url).href,
+    import.meta.url,
+  );
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const nodeVersion = "22.19.0";
 const compiler = "x86_64-w64-mingw32-g++";
 const cache = join(homedir(), ".cache", "rea-windows-native");
-const output = join(root, "native", "windows", "build");
+const inspectionFixture = process.argv[2] === "--inspection-fixture";
+if (process.argv.length > 3 || (process.argv.length > 2 && !inspectionFixture))
+  throw new Error("Unknown Windows native build argument");
+const output = inspectionFixture
+  ? join(root, ".cache", "windows-native-inspection-fixture")
+  : join(root, "native", "windows", "build");
 const run = (command, args) => {
   const result = spawnSync(command, args, {
     cwd: root,
@@ -82,9 +94,10 @@ if (!(await exists(join(headers, "node_api.h")))) {
   run("tar", ["xzf", archive, "-C", cache]);
   headers = join(cache, `node-v${nodeVersion}`, "include", "node");
 }
-const artifact = "rea-windows-x64.node";
+const artifact = WINDOWS_NATIVE_ARTIFACT.artifact;
 // MSVC short-import libraries do not produce a correct Node import table with
-// GNU ld. Generate a GNU import library for the exact stable Node-API symbols.
+// GNU ld. Generate a GNU delay-import library for the exact stable Node-API
+// symbols; addon.cc binds it to the host executable, whatever its file name.
 const sources = ["addon.cc", "filesystem.cc", "process.cc"];
 const sourceText = (
   await Promise.all(
@@ -106,11 +119,11 @@ await writeFile(
   definition,
   `LIBRARY node.exe\nEXPORTS\n${symbols.join("\n")}\n`,
 );
-run("x86_64-w64-mingw32-dlltool", ["-d", definition, "-l", library]);
+run("x86_64-w64-mingw32-dlltool", ["-d", definition, "-y", library]);
 run(compiler, [
   "-std=c++17",
   "-O2",
-  "-DNAPI_VERSION=8",
+  `-DNAPI_VERSION=${WINDOWS_NATIVE_ARTIFACT.nodeApiVersion}`,
   "-D_WIN32_WINNT=0x0A00",
   "-shared",
   "-static",
@@ -119,7 +132,9 @@ run(compiler, [
   "-Wl,--no-insert-timestamp",
   `-I${headers}`,
   "native/windows/src/addon.cc",
-  "native/windows/src/filesystem.cc",
+  inspectionFixture
+    ? "tests/fixtures/windows-native-inspection-failure.cc"
+    : "native/windows/src/filesystem.cc",
   "native/windows/src/process.cc",
   library,
   "-ladvapi32",
@@ -132,15 +147,9 @@ const packageJson = JSON.parse(
   await readFile(join(root, "package.json"), "utf8"),
 );
 const bytes = await readFile(join(output, artifact));
-const metadata = {
-  packageVersion: packageJson.version,
-  platform: "win32",
-  architecture: "x64",
-  abiVersion: 1,
-  nodeApiVersion: 8,
-  artifact,
-  artifactSha256: createHash("sha256").update(bytes).digest("hex"),
-};
+const created = createWindowsNativeManifest(packageJson.version, bytes);
+if (!created.ok) throw created.error;
+const metadata = created.value;
 await writeFile(
   join(output, "manifest.json"),
   `${JSON.stringify(metadata, null, 2)}\n`,

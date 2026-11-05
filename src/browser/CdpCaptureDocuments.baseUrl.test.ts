@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import { inspectWebPageInputSchema } from "../domain/browserObservation.js";
 import { captureDom } from "./CdpCaptureDocuments.js";
+import { capturedSvgNodeKind } from "./CdpCaptureDomNamespaces.js";
+import { CdpCaptureCompleteness } from "./CdpCaptureCompleteness.js";
 
 const origin = "https://app.example.test";
 const documentUrl = `${origin}/screens/app`;
@@ -50,10 +52,86 @@ const snapshot = (
   ],
 });
 
-const capture = (value: ReturnType<typeof snapshot>) =>
-  captureDom(value, new Set([origin]), input);
+const capture = (value: ReturnType<typeof snapshot>) => {
+  const step = captureDom(value, new Set([origin]), input).next();
+  if (!step.done) throw new Error("Unexpected SVG identity query");
+  return step.value;
+};
+
+const prefixedXhtmlSnapshot = () => {
+  const strings = [
+    `${origin}/root/prefixed.xhtml`,
+    `${origin}/assets/`,
+    "#document",
+    "h:html",
+    "h:head",
+    "h:base",
+    "h:body",
+    "h:form",
+    "h:button",
+    "",
+    "xmlns:h",
+    "http://www.w3.org/1999/xhtml",
+    "href",
+    "/assets/",
+    "action",
+    "formaction",
+  ];
+  return {
+    strings,
+    documents: [
+      {
+        documentURL: 0,
+        baseURL: 1,
+        nodes: {
+          nodeType: [9, 1, 1, 1, 1, 1, 1],
+          nodeName: [2, 3, 4, 5, 6, 7, 8],
+          nodeValue: [9, 9, 9, 9, 9, 9, 9],
+          parentIndex: [-1, 0, 1, 2, 1, 4, 5],
+          attributes: [[], [10, 11], [], [12, 13], [], [14, 9], [15, 9]],
+        },
+      },
+    ],
+  };
+};
 
 describe("DOM metadata document base URLs", () => {
+  it("splits link relations only on HTML ASCII whitespace", () => {
+    const strings = [
+      documentUrl,
+      "#document",
+      "LINK",
+      "",
+      "href",
+      "/valid",
+      "rel",
+      "alternate\u00a0mcp alternate\u000bmodel-context alternate\u2003ai-plugin alternate\ufeffservice-desc mcp\tservice-desc",
+    ];
+    const result = captureDom(
+      {
+        strings,
+        documents: [
+          {
+            documentURL: 0,
+            nodes: {
+              nodeType: [9, 1],
+              nodeName: [1, 2],
+              nodeValue: [3, 3],
+              parentIndex: [-1, 0],
+              attributes: [[], [4, 5, 6, 7]],
+            },
+          },
+        ],
+      },
+      new Set([origin]),
+      input,
+    ).next();
+    if (!result.done) throw new Error("Unexpected SVG identity query");
+    expect(
+      result.value.agentHints.map(({ declaration }) => declaration),
+    ).toEqual(["mcp", "service-desc"]);
+  });
+
   it("resolves links, actions and agent hints against the captured document base", () => {
     const result = capture(snapshot(`${origin}/screens/assets/`));
     expect(result.urls.map(({ url }) => url)).toEqual([
@@ -149,6 +227,46 @@ describe("DOM metadata document base URLs", () => {
     expect(result.nodes).toEqual([]);
     expect(result.urls).toEqual([]);
     expect(result.agentHints).toEqual([]);
+  });
+});
+
+describe("prefixed XHTML form destinations", () => {
+  it("resolves a prefixed base href against the document, not itself", () => {
+    const value = prefixedXhtmlSnapshot();
+    value.strings[1] = `${origin}/root/assets/`;
+    value.strings[13] = "assets/";
+    const step = captureDom(value, new Set([origin]), input).next();
+    if (!step.done) throw new Error("Unexpected SVG identity query");
+    expect(step.value.urls[0]?.url).toBe(`${origin}/root/assets/`);
+  });
+
+  it("resolves empty actions to the document URL", () => {
+    const result = captureDom(
+      prefixedXhtmlSnapshot(),
+      new Set([origin]),
+      input,
+    ).next();
+    if (!result.done) throw new Error("Unexpected SVG identity query");
+    expect(result.value.urls).toEqual([
+      {
+        node_index: 3,
+        attribute: "href",
+        url: `${origin}/assets/`,
+        destination_scope: "approved",
+      },
+      {
+        node_index: 5,
+        attribute: "action",
+        url: `${origin}/root/prefixed.xhtml`,
+        destination_scope: "approved",
+      },
+      {
+        node_index: 6,
+        attribute: "formaction",
+        url: `${origin}/root/prefixed.xhtml`,
+        destination_scope: "approved",
+      },
+    ]);
   });
 });
 
@@ -282,6 +400,7 @@ interface SvgSnapshotNode {
   readonly name: string;
   readonly parent: number;
   readonly attributes?: readonly (readonly [string, string])[];
+  readonly svg?: boolean;
 }
 
 const svgDocument = (
@@ -300,7 +419,13 @@ const svgDocument = (
   const nodeValue = [intern("")];
   const parentIndex = [-1];
   const attributes: number[][] = [[]];
+  const backendNodeId = [1];
+  const svgNodeKinds = new Map<string, boolean>();
   for (const element of elements) {
+    const id = backendNodeId.length + 1;
+    backendNodeId.push(id);
+    if (element.svg !== undefined)
+      svgNodeKinds.set(`${String(id)}:${element.name}`, element.svg);
     nodeType.push(1);
     nodeName.push(intern(element.name));
     nodeValue.push(intern(""));
@@ -316,20 +441,171 @@ const svgDocument = (
       {
         documentURL: 0,
         baseURL: 1,
-        nodes: { nodeType, nodeName, nodeValue, parentIndex, attributes },
+        nodes: {
+          nodeType,
+          nodeName,
+          nodeValue,
+          parentIndex,
+          attributes,
+          backendNodeId,
+        },
+        svgNodeKinds,
       },
     ],
   };
 };
 
-const captureSvg = (value: ReturnType<typeof svgDocument>) =>
-  captureDom(value, new Set([origin]), input);
+const captureSvg = (value: ReturnType<typeof svgDocument>) => {
+  const kinds = new Map(
+    value.documents.flatMap((document) => [...document.svgNodeKinds]),
+  );
+  const capture = captureDom(value, new Set([origin]), input);
+  let step = capture.next();
+  while (!step.done) {
+    step = capture.next(
+      step.value.map((query) =>
+        kinds.get(`${String(query.backendNodeId)}:${query.nodeName}`),
+      ),
+    );
+  }
+  return step.value;
+};
 
 const urlFor = (
   result: ReturnType<typeof captureSvg>,
   nodeIndex: number,
 ): (typeof result.urls)[number] | undefined =>
   result.urls.find((url) => url.node_index === nodeIndex);
+
+describe("browser SVG identity", () => {
+  const query = { backendNodeId: 42, nodeName: "a" };
+  const node = { ...query, nodeType: 1 };
+
+  it("uses only a matching described element's SVG flag", () => {
+    expect(capturedSvgNodeKind(query, { node: { ...node, isSVG: true } })).toBe(
+      true,
+    );
+    expect(
+      capturedSvgNodeKind(query, { node: { ...node, isSVG: false } }),
+    ).toBe(false);
+    expect(capturedSvgNodeKind(query, { node })).toBe(false);
+    for (const invalid of [
+      {},
+      { node: { ...node, backendNodeId: 43, isSVG: true } },
+      { node: { ...node, nodeName: "A", isSVG: true } },
+      { node: { ...node, nodeType: 3, isSVG: true } },
+      { node: { ...node, isSVG: "true" } },
+    ])
+      expect(capturedSvgNodeKind(query, invalid)).toBeUndefined();
+  });
+
+  it("distinguishes identically named SVG and MathML elements regardless of parent", () => {
+    const result = captureSvg(
+      svgDocument([
+        { name: "svg", parent: 0 },
+        { name: "desc", parent: 1 },
+        {
+          name: "a",
+          svg: true,
+          parent: 2,
+          attributes: [["xlink:href", "/svg"]],
+        },
+        {
+          name: "a",
+          svg: false,
+          parent: 2,
+          attributes: [["xlink:href", "/math"]],
+        },
+        {
+          name: "A",
+          svg: false,
+          parent: 1,
+          attributes: [["xlink:href", "/html"]],
+        },
+        {
+          name: "a",
+          svg: true,
+          parent: 0,
+          attributes: [["xlink:href", "/orphan"]],
+        },
+      ]),
+    );
+    expect(result.urls.map(({ url }) => url)).toEqual([
+      `${origin}/svg`,
+      `${origin}/orphan`,
+    ]);
+  });
+
+  it("records unresolved identity without inventing a destination or hiding attributes", () => {
+    const value = svgDocument([
+      { name: "a", parent: 0, attributes: [["xlink:href", "/unknown"]] },
+    ]);
+    const completeness = new CdpCaptureCompleteness();
+    const capture = captureDom(value, new Set([origin]), input, completeness);
+    expect(capture.next()).toEqual({
+      done: false,
+      value: [{ backendNodeId: 2, nodeName: "a" }],
+    });
+    const step = capture.next([undefined]);
+    expect(step.done).toBe(true);
+    if (!step.done) throw new Error("Unexpected second query");
+    expect(step.value.unresolvedSvgNodes).toBe(1);
+    expect(step.value.urls).toEqual([]);
+    expect(step.value.nodes[1]?.attribute_names).toEqual(["xlink:href"]);
+    expect(completeness.snapshot().excluded).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          section: "metadata",
+          reason: "provider_unavailable",
+          count: 1,
+        }),
+      ]),
+    );
+  });
+});
+
+it("keeps batched SVG identities aligned around missing IDs and ordinary links", () => {
+  const value = svgDocument([
+    { name: "a", parent: 0, attributes: [["xlink:href", "/svg"]] },
+    { name: "A", parent: 0, attributes: [["href", "/ordinary"]] },
+    { name: "a", parent: 0, attributes: [["xlink:href", "/missing-id"]] },
+    { name: "a", parent: 0, attributes: [["xlink:href", "/non-svg"]] },
+  ]);
+  const completeness = new CdpCaptureCompleteness();
+  const capture = captureDom(
+    {
+      ...value,
+      documents: value.documents.map((document) => ({
+        ...document,
+        nodes: { ...document.nodes, backendNodeId: [1, 2, 3, null, 5] },
+      })),
+    },
+    new Set([origin]),
+    input,
+    completeness,
+  );
+  expect(capture.next()).toEqual({
+    done: false,
+    value: [
+      { backendNodeId: 2, nodeName: "a" },
+      { backendNodeId: 5, nodeName: "a" },
+    ],
+  });
+  const step = capture.next([true, false]);
+  if (!step.done) throw new Error("Unexpected second batch");
+  expect(
+    step.value.urls.map(({ node_index, url }) => [node_index, url]),
+  ).toEqual([
+    [1, `${origin}/svg`],
+    [2, `${origin}/ordinary`],
+  ]);
+  expect(step.value.unresolvedSvgNodes).toBe(1);
+  expect(completeness.snapshot().excluded).toContainEqual({
+    section: "metadata",
+    reason: "provider_unavailable",
+    count: 1,
+  });
+});
 
 describe("SVG xlink:href destinations", () => {
   it("reports an SVG anchor that only has xlink:href, keeping the first value", () => {
@@ -339,6 +615,7 @@ describe("SVG xlink:href destinations", () => {
         { name: "g", parent: 1 },
         {
           name: "a",
+          svg: true,
           parent: 2,
           attributes: [
             ["xlink:href", "/xl-s2h"],
@@ -371,6 +648,7 @@ describe("SVG xlink:href destinations", () => {
           { name: "svg", parent: 0 },
           {
             name: "a",
+            svg: true,
             parent: 1,
             attributes: [
               [first, valueFor(first)],
@@ -395,18 +673,21 @@ describe("SVG xlink:href destinations", () => {
       svgDocument([
         {
           name: "A",
+          svg: false,
           parent: 0,
           attributes: [["xlink:href", "/xl-html"]],
         },
         { name: "math", parent: 0 },
         {
           name: "mrow",
+          svg: false,
           parent: 2,
           attributes: [["xlink:href", "/xl-math"]],
         },
         { name: "svg", parent: 0 },
         {
           name: "a",
+          svg: true,
           parent: 4,
           attributes: [["xlink:href", "/xl-s2h"]],
         },
@@ -425,6 +706,7 @@ describe("SVG xlink:href destinations", () => {
         { name: "svg", parent: 0 },
         {
           name: "a",
+          svg: true,
           parent: 1,
           attributes: [["xlink:href", "https://cdn.example.test/out"]],
         },
@@ -444,8 +726,18 @@ describe("SVG xlink:href destinations", () => {
     const result = captureSvg(
       svgDocument([
         { name: "svg", parent: 0 },
-        { name: "image", parent: 1, attributes: [["xlink:href", "guide"]] },
-        { name: "use", parent: 1, attributes: [["xlink:href", "icon.svg"]] },
+        {
+          name: "image",
+          svg: true,
+          parent: 1,
+          attributes: [["xlink:href", "guide"]],
+        },
+        {
+          name: "use",
+          svg: true,
+          parent: 1,
+          attributes: [["xlink:href", "icon.svg"]],
+        },
       ]),
     );
     expect(result.urls).toEqual([
@@ -466,14 +758,24 @@ describe("SVG xlink:href destinations", () => {
 });
 
 describe("SVG xlink:href context", () => {
-  it("keeps forward ancestor context local to each document", () => {
+  it("binds SVG identity to the selected element across documents", () => {
     const svg = svgDocument([
-      { name: "a", parent: 2, attributes: [["xlink:href", "/svg-link"]] },
+      {
+        name: "a",
+        svg: true,
+        parent: 2,
+        attributes: [["xlink:href", "/svg-link"]],
+      },
       { name: "g", parent: 3 },
       { name: "svg", parent: 0 },
     ]);
     const html = svgDocument([
-      { name: "A", parent: 2, attributes: [["xlink:href", "/html-link"]] },
+      {
+        name: "A",
+        svg: false,
+        parent: 2,
+        attributes: [["xlink:href", "/html-link"]],
+      },
       { name: "DIV", parent: 3 },
       { name: "BODY", parent: 0 },
     ]);
@@ -507,32 +809,39 @@ describe("SVG xlink:href context", () => {
     ]);
   });
 
-  it("stops SVG context at foreignObject and resumes it for a nested svg", () => {
-    const result = captureSvg(
-      svgDocument([
-        { name: "svg", parent: 0 },
-        { name: "foreignObject", parent: 1 },
-        {
-          name: "A",
-          parent: 2,
-          attributes: [["xlink:href", "/xl-html-fo"]],
-        },
-        { name: "svg", parent: 2 },
-        {
-          name: "a",
-          parent: 4,
-          attributes: [["xlink:href", "/xl-nested"]],
-        },
-      ]),
-    );
-    expect(urlFor(result, 3)).toBeUndefined();
-    expect(urlFor(result, 5)).toMatchObject({
-      attribute: "href",
-      url: `${origin}/xl-nested`,
-      destination_scope: "approved",
-    });
-  });
+  it.each(["foreignObject", "desc", "title"])(
+    "preserves browser SVG identity across %s HTML integration points",
+    (integrationPoint) => {
+      const result = captureSvg(
+        svgDocument([
+          { name: "svg", parent: 0 },
+          { name: integrationPoint, parent: 1 },
+          {
+            name: "A",
+            svg: false,
+            parent: 2,
+            attributes: [["xlink:href", "/xl-html-fo"]],
+          },
+          { name: "svg", parent: 2 },
+          {
+            name: "a",
+            svg: true,
+            parent: 4,
+            attributes: [["xlink:href", "/xl-nested"]],
+          },
+        ]),
+      );
+      expect(urlFor(result, 3)).toBeUndefined();
+      expect(urlFor(result, 5)).toMatchObject({
+        attribute: "href",
+        url: `${origin}/xl-nested`,
+        destination_scope: "approved",
+      });
+    },
+  );
+});
 
+describe("SVG XLink precedence and unknown identity", () => {
   it("keeps an empty href ahead of xlink:href", () => {
     const baseUrl = `${origin}/screens/assets/`;
     const result = captureSvg(
@@ -541,6 +850,7 @@ describe("SVG xlink:href context", () => {
           { name: "svg", parent: 0 },
           {
             name: "a",
+            svg: true,
             parent: 1,
             attributes: [
               ["href", ""],
@@ -567,6 +877,7 @@ describe("SVG xlink:href context", () => {
         { name: "svg", parent: 0 },
         {
           name: "a",
+          svg: true,
           parent: 1,
           attributes: [["xlink:href", "javascript:void(0)"]],
         },
@@ -582,7 +893,7 @@ describe("SVG xlink:href context", () => {
     ]);
   });
 
-  it("does not treat a cyclic or dangling parent chain as SVG", () => {
+  it("keeps an unavailable SVG identity unknown despite ancestor names", () => {
     const cyclic = captureSvg(
       svgDocument([
         { name: "g", parent: 2 },
@@ -605,4 +916,474 @@ describe("SVG xlink:href context", () => {
     expect(cyclic.urls).toEqual([]);
     expect(dangling.urls).toEqual([]);
   });
+});
+
+const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
+const XLINK_NAMESPACE = "http://www.w3.org/1999/xlink";
+const XHTML_NAMESPACE = "http://www.w3.org/1999/xhtml";
+
+const xhtmlRoot = (
+  attributes: readonly (readonly [string, string])[] = [
+    ["xmlns", XHTML_NAMESPACE],
+    ["xmlns:svg", SVG_NAMESPACE],
+    ["xmlns:xlink", XLINK_NAMESPACE],
+  ],
+): SvgSnapshotNode => ({
+  name: "html",
+  parent: 0,
+  attributes,
+});
+
+const approvedHref = (
+  nodeIndex: number,
+  url: string,
+): {
+  readonly node_index: number;
+  readonly attribute: "href";
+  readonly url: string;
+  readonly destination_scope: "approved";
+} => ({
+  node_index: nodeIndex,
+  attribute: "href",
+  url,
+  destination_scope: "approved",
+});
+
+describe("XHTML link agent hints", () => {
+  it.each([
+    ["html", "link", "xmlns"],
+    ["h:html", "h:link", "xmlns:h"],
+  ])("recognizes equivalent %s namespaces", (root, link, namespace) => {
+    const result = captureSvg(
+      svgDocument([
+        { name: root, parent: 0, attributes: [[namespace, XHTML_NAMESPACE]] },
+        {
+          name: link,
+          parent: 1,
+          attributes: [
+            ["href", "/agent"],
+            ["rel", "mcp model-context ai-plugin service-desc"],
+          ],
+        },
+      ]),
+    );
+    expect(result.agentHints).toEqual(
+      ["mcp", "model-context", "ai-plugin", "service-desc"].map(
+        (declaration) => ({
+          mechanism: "dom_link_rel",
+          declaration,
+          url: `${origin}/agent`,
+          trust: "page-declared-untrusted",
+        }),
+      ),
+    );
+  });
+
+  it("does not treat foreign or differently cased XML elements as XHTML links", () => {
+    const result = captureSvg(
+      svgDocument([
+        xhtmlRoot([
+          ["xmlns", XHTML_NAMESPACE],
+          ["xmlns:f", "urn:foreign"],
+        ]),
+        {
+          name: "f:link",
+          parent: 1,
+          attributes: [
+            ["rel", "mcp"],
+            ["href", "/agent"],
+          ],
+        },
+        {
+          name: "LINK",
+          parent: 1,
+          attributes: [
+            ["rel", "mcp"],
+            ["href", "/agent"],
+          ],
+        },
+      ]),
+    );
+    expect(result.agentHints).toEqual([]);
+  });
+});
+
+describe("XML SVG roots and namespace scope restoration", () => {
+  it.each(["svg", "document"])(
+    "resolves namespaces under an unprefixed XML %s root",
+    (name) => {
+      const result = captureSvg(
+        svgDocument([
+          {
+            name,
+            parent: 0,
+            attributes: [
+              ["xmlns", SVG_NAMESPACE],
+              ["xmlns:p", XLINK_NAMESPACE],
+            ],
+          },
+          {
+            name: "a",
+            svg: true,
+            parent: 1,
+            attributes: [["p:href", "/linked"]],
+          },
+        ]),
+      );
+      expect(result.urls).toEqual([approvedHref(2, `${origin}/linked`)]);
+    },
+  );
+
+  it.each([2, 3, 99])(
+    "rejects self-parent, cyclic and dangling XML ancestry (%s)",
+    (parent) => {
+      const result = captureSvg(
+        svgDocument([
+          xhtmlRoot(),
+          {
+            name: "svg:a",
+            parent,
+            attributes: [
+              ["xmlns:svg", SVG_NAMESPACE],
+              ["xmlns:p", XLINK_NAMESPACE],
+              ["p:href", "/invalid"],
+            ],
+          },
+          { name: "svg:g", parent: 2 },
+        ]),
+      );
+      expect(result.urls).toEqual([]);
+    },
+  );
+
+  it("restores namespace declarations and undeclarations before visiting siblings", () => {
+    const result = captureSvg(
+      svgDocument([
+        xhtmlRoot(),
+        {
+          name: "svg:a",
+          parent: 1,
+          attributes: [
+            ["xmlns:xlink", ""],
+            ["xlink:href", "/undeclared"],
+          ],
+        },
+        {
+          name: "svg:a",
+          parent: 1,
+          attributes: [["xlink:href", "/inherited"]],
+        },
+        {
+          name: "svg:a",
+          parent: 1,
+          attributes: [
+            ["xmlns:svg", "other"],
+            ["xlink:href", "/rebound"],
+          ],
+        },
+        { name: "svg:a", parent: 1, attributes: [["xlink:href", "/restored"]] },
+      ]),
+    );
+    expect(result.urls).toEqual([
+      approvedHref(3, `${origin}/inherited`),
+      approvedHref(5, `${origin}/restored`),
+    ]);
+  });
+});
+
+describe("XHTML and XML SVG namespace prefixes", () => {
+  it("reports prefixed svg:a, svg:image, and an svg:a with no svg parent", () => {
+    const result = captureSvg(
+      svgDocument([
+        xhtmlRoot(),
+        { name: "svg:svg", parent: 1 },
+        {
+          name: "svg:a",
+          parent: 2,
+          attributes: [
+            ["xlink:href", "/xl-pa1"],
+            ["xlink:href", "/later"],
+          ],
+        },
+        {
+          name: "svg:image",
+          parent: 2,
+          attributes: [["xlink:href", "guide"]],
+        },
+        {
+          name: "svg:a",
+          parent: 1,
+          attributes: [["xlink:href", "/xl-orphan"]],
+        },
+      ]),
+    );
+    expect(result.nodes[3]?.node_name).toBe("svg:a");
+    expect(result.nodes[3]?.attribute_names).toEqual(["xlink:href"]);
+    expect(result.urls).toEqual([
+      approvedHref(3, `${origin}/xl-pa1`),
+      approvedHref(4, `${origin}/screens/assets/guide`),
+      approvedHref(5, `${origin}/xl-orphan`),
+    ]);
+  });
+
+  it("reports svg:a under svg:foreignObject and skips XHTML anchors there", () => {
+    const result = captureSvg(
+      svgDocument([
+        xhtmlRoot([
+          ["xmlns", XHTML_NAMESPACE],
+          ["xmlns:svg", SVG_NAMESPACE],
+          ["xmlns:xlink", XLINK_NAMESPACE],
+          ["xmlns:h", XHTML_NAMESPACE],
+        ]),
+        { name: "svg:svg", parent: 1 },
+        { name: "svg:foreignObject", parent: 2 },
+        {
+          name: "a",
+          svg: true,
+          parent: 3,
+          attributes: [["xlink:href", "/xl-html-fo"]],
+        },
+        {
+          name: "h:a",
+          parent: 3,
+          attributes: [["xlink:href", "/xl-h"]],
+        },
+        {
+          name: "svg:a",
+          parent: 3,
+          attributes: [["xlink:href", "/xl-fo-svg"]],
+        },
+      ]),
+    );
+    expect(urlFor(result, 4)).toBeUndefined();
+    expect(urlFor(result, 5)).toBeUndefined();
+    expect(result.urls).toEqual([approvedHref(6, `${origin}/xl-fo-svg`)]);
+  });
+
+  it("reads XLink by namespace, including a prefix other than xlink", () => {
+    const result = captureSvg(
+      svgDocument([
+        xhtmlRoot([["xmlns", XHTML_NAMESPACE]]),
+        {
+          name: "svg",
+          parent: 1,
+          attributes: [
+            ["xmlns", SVG_NAMESPACE],
+            ["xmlns:xlink", "http://example.com/not-xlink"],
+            ["xmlns:x", XLINK_NAMESPACE],
+          ],
+        },
+        {
+          name: "a",
+          svg: true,
+          parent: 2,
+          attributes: [
+            ["xlink:href", "/not-xlink"],
+            ["x:href", "/xl-custom"],
+            ["x:href", "/later"],
+          ],
+        },
+      ]),
+    );
+    expect(result.nodes[3]?.attribute_names).toEqual(["xlink:href", "x:href"]);
+    expect(result.urls).toEqual([approvedHref(3, `${origin}/xl-custom`)]);
+  });
+
+  it("keeps plain href ahead of a namespaced XLink href, including an empty href", () => {
+    const baseUrl = `${origin}/screens/assets/`;
+    const anchor = (
+      parent: number,
+      attributes: readonly (readonly [string, string])[],
+    ): SvgSnapshotNode => ({
+      name: "svg:a",
+      parent,
+      attributes,
+    });
+    const result = captureSvg(
+      svgDocument(
+        [
+          xhtmlRoot(),
+          { name: "svg:svg", parent: 1 },
+          anchor(2, [
+            ["xlink:href", "/xlink-loses"],
+            ["href", "/href-wins"],
+          ]),
+          anchor(2, [
+            ["href", "/href-wins"],
+            ["xlink:href", "/xlink-loses"],
+          ]),
+          anchor(2, [
+            ["href", ""],
+            ["xlink:href", "/xlink-should-lose"],
+          ]),
+        ],
+        baseUrl,
+      ),
+    );
+    expect(result.urls).toEqual([
+      approvedHref(3, `${origin}/href-wins`),
+      approvedHref(4, `${origin}/href-wins`),
+      approvedHref(5, baseUrl),
+    ]);
+  });
+});
+
+describe("XHTML SVG exclusions, HTML documents, and prefix scope", () => {
+  it("classifies a prefixed SVG xlink:href outside the allowed origins as outside_policy", () => {
+    const result = captureSvg(
+      svgDocument([
+        xhtmlRoot(),
+        { name: "svg:svg", parent: 1 },
+        {
+          name: "svg:a",
+          parent: 2,
+          attributes: [["xlink:href", "https://cdn.example.test/out"]],
+        },
+      ]),
+    );
+    expect(result.urls).toEqual([
+      {
+        node_index: 3,
+        attribute: "href",
+        url: null,
+        destination_scope: "outside_policy",
+      },
+    ]);
+  });
+
+  it("does not treat bogus:svg in another namespace as SVG", () => {
+    const result = captureSvg(
+      svgDocument([
+        xhtmlRoot([
+          ["xmlns", XHTML_NAMESPACE],
+          ["xmlns:svg", SVG_NAMESPACE],
+          ["xmlns:xlink", XLINK_NAMESPACE],
+          ["xmlns:bogus", "http://example.com/not-svg"],
+        ]),
+        {
+          name: "bogus:svg",
+          parent: 1,
+          attributes: [["xlink:href", "/xl-bogus"]],
+        },
+        {
+          name: "bogus:a",
+          parent: 2,
+          attributes: [["xlink:href", "/xl-bogus-a"]],
+        },
+        {
+          name: "svg:a",
+          parent: 1,
+          attributes: [["xlink:href", "/xl-kept"]],
+        },
+      ]),
+    );
+    expect(result.nodes[2]?.node_name).toBe("bogus:svg");
+    expect(result.urls).toEqual([approvedHref(4, `${origin}/xl-kept`)]);
+  });
+
+  it("leaves HTML documents on literal svg and xlink:href names", () => {
+    const result = captureSvg(
+      svgDocument([
+        { name: "HTML", parent: 0 },
+        {
+          name: "svg",
+          parent: 1,
+          attributes: [
+            ["xmlns", SVG_NAMESPACE],
+            ["xmlns:x", XLINK_NAMESPACE],
+          ],
+        },
+        {
+          name: "a",
+          svg: true,
+          parent: 2,
+          attributes: [["xlink:href", "/xl-literal"]],
+        },
+        {
+          name: "a",
+          svg: true,
+          parent: 2,
+          attributes: [["x:href", "/xl-custom-html"]],
+        },
+        {
+          name: "svg:a",
+          parent: 1,
+          attributes: [
+            ["xmlns:svg", SVG_NAMESPACE],
+            ["xmlns:xlink", XLINK_NAMESPACE],
+            ["xlink:href", "/xl-prefixed-html"],
+          ],
+        },
+        {
+          name: "A",
+          svg: false,
+          parent: 1,
+          attributes: [["xlink:href", "/xl-html-anchor"]],
+        },
+      ]),
+    );
+    expect(result.urls).toEqual([approvedHref(3, `${origin}/xl-literal`)]);
+  });
+});
+
+describe("XML namespace resolution ordering and capacity", () => {
+  it("applies an element's own xmlns declarations to its name and href", () => {
+    const result = captureSvg(
+      svgDocument([
+        { name: "html", parent: 0, attributes: [["xmlns", XHTML_NAMESPACE]] },
+        {
+          name: "svg:a",
+          parent: 1,
+          attributes: [
+            ["xmlns:svg", SVG_NAMESPACE],
+            ["xmlns:xlink", XLINK_NAMESPACE],
+            ["xlink:href", "/xl-self"],
+          ],
+        },
+      ]),
+    );
+    expect(result.urls).toEqual([approvedHref(2, `${origin}/xl-self`)]);
+  });
+
+  it("resolves a prefix declared on a later ancestor", () => {
+    const result = captureSvg(
+      svgDocument([
+        {
+          name: "svg:a",
+          parent: 2,
+          attributes: [["xlink:href", "/forward"]],
+        },
+        { name: "svg:svg", parent: 3 },
+        xhtmlRoot(),
+      ]),
+    );
+    expect(result.urls).toEqual([approvedHref(1, `${origin}/forward`)]);
+  });
+
+  it("resolves a deep chain with distinct namespace declarations without quadratic expansion", () => {
+    const depth = 12_000;
+    const elements: SvgSnapshotNode[] = [
+      xhtmlRoot(),
+      { name: "svg:svg", parent: 1 },
+    ];
+    let parent = 2;
+    for (let index = 0; index < depth; index += 1) {
+      elements.push({
+        name: "svg:g",
+        parent,
+        attributes: [[`xmlns:p${index}`, `urn:prefix:${index}`]],
+      });
+      parent = elements.length;
+    }
+    elements.push({
+      name: "svg:a",
+      parent,
+      attributes: [["xlink:href", "/deep"]],
+    });
+    const snapshot = svgDocument(elements);
+    const result = captureSvg(snapshot);
+    expect(result.urls).toEqual([
+      approvedHref(elements.length, `${origin}/deep`),
+    ]);
+  }, 30_000);
 });

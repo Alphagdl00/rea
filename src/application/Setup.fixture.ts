@@ -1,19 +1,29 @@
-import { skillDestinations } from "./SetupSkill.js";
-import {
-  type ClientConfigurationInspection,
-  type ClientConfigurationResult,
-  type SetupHost,
-  type SetupOptions,
-  type SetupProviderEnvironment,
+import { skillDestinations, SetupSkillInstallError } from "./SetupSkill.js";
+import type {
+  ClientConfigurationInspection,
+  ClientConfigurationResult,
+  SetupHost,
+  SetupOptions,
+  SetupProviderEnvironment,
 } from "./SetupTypes.js";
 import type { SetupClient } from "./SupportedClients.js";
-import type { SetupHopperInstallResult } from "./SetupInstallFailure.js";
-import type { DoctorCheck, DoctorReport, DoctorScope } from "./Doctor.js";
+import type {
+  SetupHopperInstallFailure,
+  SetupHopperInstallResult,
+} from "./SetupInstallFailure.js";
+import { err, ok, type Result } from "../domain/result.js";
+import type {
+  DoctorCheck,
+  DoctorProviderInspection,
+  DoctorReport,
+  DoctorScope,
+} from "./Doctor.js";
 import type { LinuxDistribution } from "./LinuxHopper.js";
 import { PRODUCT_IDENTITY, SDK_IDENTITY } from "../identity.js";
-import { CATALOG_IDENTITY } from "../catalogIdentity.js";
+import { DEFAULT_CATALOG_IDENTITY } from "../catalogIdentity.js";
 import type { ClientRegistrationStatus } from "./ClientRegistrationStatus.js";
-import { setupRegistrationCommand } from "./SetupHost.js";
+import { currentClientRegistrationCommand } from "./ClientRegistrationIdentity.js";
+import { CURRENT_ENTRYPOINT_PATH } from "../process/CurrentEntrypointPath.js";
 
 /** Recording setup host for service-level planning and recovery tests. */
 export class FakeSetupHost implements SetupHost {
@@ -22,14 +32,20 @@ export class FakeSetupHost implements SetupHost {
   skillDestinations(clientIds: readonly string[]) {
     return skillDestinations(this.homeDirectory, clientIds);
   }
-  readonly registrationCommand: readonly string[];
-  nodeVersion = "24.18.0";
+  registrationCommand: readonly string[];
+  registrationCommandBlocker?: string;
+  nodeVersion = "24.22.1";
   version: string | undefined = "14.5";
   distribution: LinuxDistribution | undefined;
   hopper: string | undefined;
   ghidra: string | undefined;
   javaHome: string | undefined;
   hopperInstallSucceeds = true;
+  hopperInstallFailure: SetupHopperInstallFailure = {
+    status: "failed",
+    code: "download_failed",
+    remediation: "Download failed.",
+  };
   skill: "installed" | "unchanged" | "failed" = "installed";
   clients: readonly SetupClient[] = [];
   availableClients: readonly SetupClient[] | undefined;
@@ -40,6 +56,7 @@ export class FakeSetupHost implements SetupHost {
   hopperReplaceRequests: boolean[] = [];
   configurations = 0;
   skillInstalls = 0;
+  skillDirectoryValidations: Array<readonly string[]> = [];
   doctorCalls = 0;
   doctorScopes: Array<DoctorScope | undefined> = [];
   checkedHopperPaths: Array<string | undefined> = [];
@@ -47,12 +64,15 @@ export class FakeSetupHost implements SetupHost {
   configuredCommands: Array<readonly string[]> = [];
   doctorHealthy: boolean | undefined;
   scopedDoctorHealthy: boolean | undefined;
+  providerInspections: readonly DoctorProviderInspection[] | undefined =
+    undefined;
   linuxDemoRuntimeMissing = false;
   unsupportedHopperVersion = false;
+  hopperLauncherConfigured = false;
 
   constructor(platform: NodeJS.Platform = "darwin") {
     this.platform = platform;
-    this.registrationCommand = setupRegistrationCommand(platform, false);
+    this.registrationCommand = currentClientRegistrationCommand({ platform });
   }
 
   macosVersion = (): Promise<string | undefined> =>
@@ -61,6 +81,10 @@ export class FakeSetupHost implements SetupHost {
     Promise.resolve(this.distribution);
   initialSetupState = async (scope?: DoctorScope) => ({
     ...(this.hopper === undefined ? {} : { hopperPath: this.hopper }),
+    ...(this.hopperLauncherConfigured
+      ? { hopperLauncherConfigured: true }
+      : {}),
+    providerConfigured: this.hopper !== undefined || this.ghidra !== undefined,
     providerEnvironment: {
       ...(this.hopper === undefined
         ? {}
@@ -83,11 +107,7 @@ export class FakeSetupHost implements SetupHost {
         launcherPath: this.hopper,
       });
     }
-    return Promise.resolve({
-      status: "failed",
-      code: "download_failed",
-      remediation: "Download failed.",
-    });
+    return Promise.resolve(this.hopperInstallFailure);
   };
   detectedClients = (): Promise<readonly SetupClient[]> =>
     Promise.resolve(this.clients);
@@ -120,11 +140,30 @@ export class FakeSetupHost implements SetupHost {
     Promise.resolve(
       this.clientInspections.get(client.name) ?? { status: "update" },
     );
-  skillNeedsInstall = (): Promise<boolean> =>
+  skillNeedsInstall: SetupHost["skillNeedsInstall"] = (): Promise<boolean> =>
     Promise.resolve(this.skill !== "unchanged");
-  installSkill = (): Promise<"installed" | "unchanged" | "failed"> => {
+  validateSkillDirectories = (
+    clientIds: readonly string[],
+  ): Promise<Result<void, SetupSkillInstallError>> => {
+    this.skillDirectoryValidations.push(clientIds);
+    return Promise.resolve(ok(undefined));
+  };
+  installSkill = () => {
     this.skillInstalls += 1;
-    return Promise.resolve(this.skill);
+    return Promise.resolve(
+      this.skill === "failed"
+        ? err(
+            new SetupSkillInstallError({
+              path: "/fixture/home/.agents/skills/reverse-engineer-anything/SKILL.md",
+              stage: "write",
+              reason: "injected skill write failure",
+              rollbackFailures: [],
+              recoveryBackupPaths: [],
+              cause: new Error("injected skill write failure"),
+            }),
+          )
+        : ok(this.skill),
+    );
   };
   doctor = (scope?: DoctorScope): Promise<DoctorReport> => {
     this.doctorCalls += 1;
@@ -159,6 +198,7 @@ export class FakeSetupHost implements SetupHost {
       scope === undefined
         ? environmentHealthy
         : (scope.clients?.length ?? 0) === 0 &&
+            (scope.skillClients?.length ?? 0) === 0 &&
             (scope.providers?.length ?? 0) === 0 &&
             scope.skill !== true
           ? true
@@ -169,6 +209,9 @@ export class FakeSetupHost implements SetupHost {
       scope: {
         mode: scope === undefined ? "audit-wide" : "explicit",
         clients: scope?.clients ?? [],
+        ...(scope?.skillClients === undefined
+          ? {}
+          : { skill_clients: scope.skillClients }),
         providers: scope?.providers ?? [],
         skill: scope?.skill === true,
         target: null,
@@ -176,12 +219,15 @@ export class FakeSetupHost implements SetupHost {
       scope_checks: checks,
       informational_checks: [],
       ...(this.hopper === undefined ? {} : { hopperPath: this.hopper }),
+      ...(this.providerInspections === undefined
+        ? {}
+        : { providerInspections: this.providerInspections }),
       checks,
       identity: {
         cli_package_version: PRODUCT_IDENTITY.packageVersion,
         expected_skill_version: PRODUCT_IDENTITY.skillVersion,
         sdk: SDK_IDENTITY,
-        catalog: CATALOG_IDENTITY,
+        catalog: DEFAULT_CATALOG_IDENTITY,
         live_server: {
           state: "unknown",
           remediation: "Inspect the running server.",

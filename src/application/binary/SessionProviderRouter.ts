@@ -1,9 +1,9 @@
-import type { AnalysisProviderSelector } from "../../contracts/providerSelection.js";
+import type { AnalysisProviderSelector } from "../../domain/providerSelection.js";
 import type { AnalysisProfileCommitment } from "../../domain/analysisProfile.js";
 import type { BinaryTarget } from "../../domain/binaryTargetTypes.js";
 import { AnalysisCapabilityUnavailableError } from "../../domain/analysisErrorCore.js";
 import { ProviderSelectionError } from "../../domain/providerSelectionError.js";
-import { type AnalysisError } from "../../domain/analysisErrorBase.js";
+import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import type {
   AnalysisClient,
@@ -70,6 +70,16 @@ export class SessionProviderRouter {
     return this.route;
   }
 
+  /** Close provider owners not represented by the currently bound client. */
+  closeOwnedResources() {
+    return this.registry.closeOwnedResources();
+  }
+
+  /** Report retained candidate cleanup without performing cleanup work. */
+  hasPendingOwnedResources(): boolean {
+    return this.registry.hasPendingOwnedResources();
+  }
+
   /** Resolve target routes before any provider client is created. */
   async resolve(
     target: BinaryTarget,
@@ -88,10 +98,17 @@ export class SessionProviderRouter {
   }
 
   /** Candidate status authoritative for the active or target-free route. */
-  candidateStatuses(
+  async candidateStatuses(
     route: SessionProviderRoute,
-  ): readonly AnalysisProviderCandidateStatus[] {
-    return route.selection?.candidates ?? this.registry.candidates();
+    signal?: AbortSignal,
+  ): Promise<readonly AnalysisProviderCandidateStatus[]> {
+    return (
+      route.selection?.candidates ??
+      this.registry.candidates(
+        undefined,
+        signal === undefined ? {} : { signal },
+      )
+    );
   }
 
   /** Produce exact candidate rejections for an intentionally unbound route. */
@@ -123,9 +140,18 @@ const selectableRoute = (
       ? providers[0]
       : providers.length === 0
         ? undefined
-        : new CompositeProvider(providers);
+        : new CompositeProvider(
+            providers,
+            binding?.createClient === undefined
+              ? new Map()
+              : new Map([[binding.identity.id, binding.createClient]]),
+          );
   const identity = provider?.identity() ?? emptyProviderIdentity();
-  const capabilities = capabilityMap(provider?.capabilities() ?? []);
+  // The binding attributes deep-provider capabilities to the resolved version.
+  const capabilities = capabilityMap([
+    ...auxiliaryProviders.flatMap((auxiliary) => auxiliary.capabilities()),
+    ...(binding?.capabilities ?? []),
+  ]);
   return {
     identity,
     capabilities,

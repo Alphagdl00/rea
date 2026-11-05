@@ -53,7 +53,7 @@ export const releaseInventorySchema = z.object({
   pullRequests: z.array(pullRequest),
 });
 
-export async function readReleaseHistory(run, base, target) {
+export async function requireCompleteReleaseHistory(run) {
   if (
     (await run("git", ["rev-parse", "--is-shallow-repository"])).trim() !==
     "false"
@@ -61,6 +61,10 @@ export async function readReleaseHistory(run, base, target) {
     throw new Error(
       "Release inventory requires complete Git history; fetch --unshallow first",
     );
+}
+
+export async function readReleaseHistory(run, base, target) {
+  await requireCompleteReleaseHistory(run);
   const resolve = async (ref) =>
     sha.parse(
       (
@@ -98,13 +102,16 @@ export async function readReleaseHistory(run, base, target) {
   return { base: baseSha, target: targetSha, commits };
 }
 
-// REA history maps Anthropic and Cursor's agent trailers to ordinary User actors.
+// GitHub maps these coding-agent trailers to ordinary User actors.
 // Keep those source identities in the inventory while excluding automation credit.
-const AGENT_ACCOUNTS = new Set(["claude", "cursoragent"]);
+const AGENT_ACCOUNTS = new Set(["claude", "cursoragent", "codex", "copilot"]);
+// REA's maintainer requested external-contributor thanks without self-credit.
+const MAINTAINER_ACCOUNTS = new Set(["morluto"]);
 const human = (value) =>
   value?.__typename === "User" &&
   !value.login.endsWith("[bot]") &&
-  !AGENT_ACCOUNTS.has(value.login.toLowerCase())
+  !AGENT_ACCOUNTS.has(value.login.toLowerCase()) &&
+  !MAINTAINER_ACCOUNTS.has(value.login.toLowerCase())
     ? value.login
     : undefined;
 const unique = (values) =>
@@ -161,6 +168,12 @@ export function contributionRecord(raw) {
       );
   }
   return `${lines.join("\n")}\n`;
+}
+
+/** Keep the full authorship snapshot available without duplicating public thanks. */
+export function contributionSummary(raw) {
+  const inventory = releaseInventorySchema.parse(raw);
+  return `Full contribution record: [${inventory.commits.length} commits and ${inventory.pullRequests.length} merged PR${inventory.pullRequests.length === 1 ? "" : "s"}](https://github.com/${inventory.repository}/blob/rea-agents-${inventory.version}/docs/releases/${inventory.version}.contributions.json).\n`;
 }
 
 export function selectedReleaseNotes(text, version) {
@@ -236,7 +249,8 @@ function requiredCredits(inventory, bullet, references) {
     if (matches[0].parents.length > 1) continue;
     for (const identity of matches[0].authors) {
       const handle = human(identity.user);
-      if (handle) required.push({ handle, context: `commit ${match[2]}` });
+      if (handle)
+        required.push({ handle, context: `commit ${matches[0].sha}` });
     }
   }
   return required;
@@ -264,6 +278,8 @@ function verifyEditorialCredits(inventory, prose) {
     ]).map((handle) => handle.toLowerCase()),
   );
   const errors = [];
+  const requiredByContext = new Map();
+  const thankedByContext = new Map();
   for (const bullet of proseBullets(prose)) {
     const references = bulletPrs(bullet, inventory.repository);
     const start = bullet.indexOf("Thanks ");
@@ -282,13 +298,21 @@ function verifyEditorialCredits(inventory, prose) {
       bullet,
       references,
     )) {
-      if (!thanked.has(handle.toLowerCase()))
-        errors.push(`Missing Thanks @${handle} in bullet for ${context}`);
+      const required = requiredByContext.get(context) ?? new Set();
+      required.add(handle);
+      requiredByContext.set(context, required);
+      const credited = thankedByContext.get(context) ?? new Set();
+      for (const login of thanked) credited.add(login);
+      thankedByContext.set(context, credited);
     }
     for (const handle of thanked)
       if (!eligible.has(handle))
         errors.push(`Unverified human credit @${handle}`);
   }
+  for (const [context, required] of requiredByContext)
+    for (const handle of required)
+      if (!thankedByContext.get(context)?.has(handle.toLowerCase()))
+        errors.push(`Missing Thanks @${handle} for ${context}`);
   return errors;
 }
 
@@ -305,8 +329,15 @@ export function verifyReleaseNotes(raw, text, body) {
       "Release notes exceed GitHub's body budget; shorten prose without dropping credit",
     );
   const record = contributionRecord(inventory).trim();
-  const start = notes.indexOf("### Complete contribution record");
-  if (start < 0 || notes.slice(start).trim() !== record)
+  const summary = contributionSummary(inventory).trim();
+  const start = notes.endsWith(summary)
+    ? notes.length - summary.length
+    : notes.indexOf("### Complete contribution record");
+  if (
+    start < 0 ||
+    (notes.slice(start).trim() !== record &&
+      notes.slice(start).trim() !== summary)
+  )
     throw new Error(
       "Contribution record differs from inventory; regenerate it with release-notes record",
     );
@@ -336,6 +367,60 @@ export function verifyReleaseNotes(raw, text, body) {
         .map((identity) => ({ sha: item.sha, ...identity })),
     ),
   };
+}
+
+const VERSION_ONLY_PLUGIN_METADATA = new Set([
+  ".claude-plugin/plugin.json",
+  ".codex-plugin/plugin.json",
+  ".codex-plugin/mcp.json",
+  ".claude-plugin/marketplace.json",
+  ".agents/plugins/marketplace.json",
+]);
+
+/** Serialize plugin metadata with only its release-owned version fields blanked. */
+function pluginMetadataWithoutVersions(path, text) {
+  const manifest = JSON.parse(text);
+  if (manifest === null || typeof manifest !== "object") return text;
+  if (path.endsWith("marketplace.json")) {
+    if (Array.isArray(manifest.plugins))
+      for (const plugin of manifest.plugins)
+        if (
+          plugin?.name === "rea" &&
+          plugin?.source?.source === "npm" &&
+          plugin.source.package === "rea-agents" &&
+          typeof plugin.source.version === "string"
+        )
+          plugin.source.version = "";
+    return JSON.stringify(manifest);
+  }
+  if ("version" in manifest) manifest.version = "";
+  const launch = manifest.mcpServers?.rea?.args;
+  // Only the scalar pinned version is release-owned; the launcher owns the
+  // fixed package name and the executable/path remain product behavior.
+  if (Array.isArray(launch) && typeof launch[1] === "string") launch[1] = "";
+  return JSON.stringify(manifest);
+}
+
+/**
+ * Plugin metadata also carries behavior, so a release may change only
+ * its version, pinned server launch, and exact REA marketplace version. Any other difference, an unreadable
+ * side, or a manifest added by the release counts as a product change.
+ */
+async function changesOnlyPluginVersions(run, path, from, to) {
+  try {
+    return (
+      pluginMetadataWithoutVersions(
+        path,
+        await run("git", ["show", `${from}:${path}`]),
+      ) ===
+      pluginMetadataWithoutVersions(
+        path,
+        await run("git", ["show", `${to}:${path}`]),
+      )
+    );
+  } catch {
+    return false;
+  }
 }
 
 /** Reject stale inventories and product changes made after the editorial target. */
@@ -406,7 +491,16 @@ export async function verifyInventoryHistory(run, raw, source) {
     )
       .split("\0")
       .filter(Boolean);
-    const product = paths.filter((path) => !allowed.has(path));
+    const product = [];
+    for (const path of paths) {
+      if (allowed.has(path)) continue;
+      if (
+        VERSION_ONLY_PLUGIN_METADATA.has(path) &&
+        (await changesOnlyPluginVersions(run, path, inventory.target, resolved))
+      )
+        continue;
+      product.push(path);
+    }
     if (product.length)
       throw new Error(
         `Product changed after notes target; regenerate inventory: ${product.join(", ")}`,

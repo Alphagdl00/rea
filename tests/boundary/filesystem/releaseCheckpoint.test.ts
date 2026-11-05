@@ -1,10 +1,15 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { expect, it } from "vitest";
+import { afterAll, expect, it } from "vitest";
 import { z } from "zod";
 import { parse } from "yaml";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import {
+  createTestWorkspace,
+  removeTestWorkspace,
+  type TestWorkspace,
+} from "../../support/workspace/workspaceFixture.js";
 import {
   executeWorkflowFixture as execFileAsync,
   workflowGit as git,
@@ -14,6 +19,32 @@ const verifier = fileURLToPath(
   new URL("../../../scripts/verify-release-checkpoint.mjs", import.meta.url),
 );
 
+const pluginManifestPaths = [
+  ".claude-plugin/plugin.json",
+  ".codex-plugin/plugin.json",
+] as const;
+
+const pluginManifest = (version: string, launch = version) => ({
+  version,
+  mcpServers: {
+    rea: {
+      command: "node",
+      args: ["${CLAUDE_PLUGIN_ROOT}/scripts/plugin-mcp-launcher.mjs", launch],
+    },
+  },
+});
+
+const codexServerConfig = (version: string, launch = version) => ({
+  mcpServers: {
+    rea: {
+      command: "node",
+      args: ["./scripts/plugin-mcp-launcher.mjs", launch],
+      cwd: ".",
+      startup_timeout_sec: 30,
+    },
+  },
+});
+
 async function metadata(
   directory: string,
   version: string,
@@ -22,7 +53,15 @@ async function metadata(
 ) {
   await mkdir(join(directory, "docs"), { recursive: true });
   await mkdir(join(directory, "src"), { recursive: true });
+  for (const path of pluginManifestPaths)
+    await mkdir(join(directory, dirname(path)), { recursive: true });
   const files = {
+    ".claude-plugin/plugin.json": pluginManifest(version),
+    ".codex-plugin/plugin.json": {
+      version,
+      mcpServers: "./.codex-plugin/mcp.json",
+    },
+    ".codex-plugin/mcp.json": codexServerConfig(version),
     "package.json": { name: "rea-agents", version },
     "package-lock.json": { version, packages: { "": { version } } },
     ".release-please-manifest.json": { ".": version },
@@ -52,27 +91,72 @@ async function metadata(
   );
 }
 
+interface ReleaseSeed {
+  readonly directory: string;
+  readonly releasedSha: string;
+}
+
+const seedWorkspaces: TestWorkspace[] = [];
+const seedPromises = new Map<string, Promise<ReleaseSeed>>();
+
+const releaseSeed = (versioning?: string): Promise<ReleaseSeed> => {
+  const key = versioning ?? "default";
+  const existing = seedPromises.get(key);
+  if (existing !== undefined) return existing;
+
+  const pending = (async (): Promise<ReleaseSeed> => {
+    const workspace = await createTestWorkspace("rea-release-checkpoint-seed-");
+    seedWorkspaces.push(workspace);
+    const directory = workspace.path(key);
+    await mkdir(directory, { recursive: true });
+    await git(directory, ["init", "--initial-branch=main"]);
+    await metadata(directory, "4.0.0", "Initial release", versioning);
+    await git(directory, ["add", "."]);
+    await git(
+      directory,
+      ["commit", "-m", "chore: seed"],
+      "2026-01-01T00:00:00Z",
+    );
+    await git(directory, ["switch", "-c", "release/5.0.0"]);
+    await metadata(directory, "5.0.0", "Previous release", versioning);
+    await git(directory, ["add", "."]);
+    await git(
+      directory,
+      ["commit", "-m", "chore: release 5.0.0"],
+      "2026-01-03T00:00:00Z",
+    );
+    const releasedSha = await git(directory, ["rev-parse", "HEAD"]);
+    await git(directory, ["tag", "rea-agents-5.0.0"]);
+    await git(directory, ["switch", "main"]);
+    return { directory, releasedSha };
+  })();
+  seedPromises.set(key, pending);
+  return pending;
+};
+
+afterAll(async () => {
+  await Promise.allSettled(seedPromises.values());
+  const cleanup = await Promise.allSettled(
+    seedWorkspaces.map(({ root }) => removeTestWorkspace(root)),
+  );
+  const failures = cleanup.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : [],
+  );
+  if (failures.length > 0)
+    throw new AggregateError(
+      failures,
+      "Could not remove release checkpoint seeds",
+    );
+});
+
 async function fixture(
   subject = "fix(contracts)!: require absolute paths (#948)",
   footer = "",
   options: { mergePullRequest?: boolean; versioning?: string } = {},
 ) {
+  const seed = await releaseSeed(options.versioning);
   const directory = await createTestTempDirectory("rea-release-ancestry-");
-  await git(directory, ["init", "--initial-branch=main"]);
-  await metadata(directory, "4.0.0", "Initial release", options.versioning);
-  await git(directory, ["add", "."]);
-  await git(directory, ["commit", "-m", "chore: seed"], "2026-01-01T00:00:00Z");
-  await git(directory, ["switch", "-c", "release/5.0.0"]);
-  await metadata(directory, "5.0.0", "Previous release", options.versioning);
-  await git(directory, ["add", "."]);
-  await git(
-    directory,
-    ["commit", "-m", "chore: release 5.0.0"],
-    "2026-01-03T00:00:00Z",
-  );
-  const releasedSha = await git(directory, ["rev-parse", "HEAD"]);
-  await git(directory, ["tag", "rea-agents-5.0.0"]);
-  await git(directory, ["switch", "main"]);
+  await cp(seed.directory, directory, { recursive: true, dereference: true });
   if (options.mergePullRequest) {
     await git(directory, ["switch", "-c", "change/contracts"]);
   }
@@ -115,7 +199,7 @@ async function fixture(
     directory,
     sourceSha,
     changedSha,
-    releasedSha,
+    releasedSha: seed.releasedSha,
     versioning: options.versioning,
   };
 }
@@ -515,6 +599,51 @@ it.each([
   });
 });
 
+it.each(
+  pluginManifestPaths.map((path) => ({
+    path,
+    stale: "version",
+    manifest:
+      path === ".codex-plugin/plugin.json"
+        ? { version: "5.1.0", mcpServers: "./.codex-plugin/mcp.json" }
+        : pluginManifest("5.1.0"),
+    failure: "declares 5.1.0; release branch requires 6.0.0",
+  })),
+)("rejects a plugin $stale in $path", async ({ path, manifest, failure }) => {
+  const f = await fixture();
+  await candidate(f, "6.0.0");
+  await writeFile(join(f.directory, path), JSON.stringify(manifest));
+  await git(f.directory, ["add", "."]);
+  await git(f.directory, ["commit", "-m", "chore: stale plugin manifest"]);
+  await expect(verify(f)).rejects.toMatchObject({
+    code: 1,
+    stderr: expect.stringContaining(failure),
+  });
+});
+
+it.each([
+  {
+    path: ".claude-plugin/plugin.json",
+    manifest: pluginManifest("6.0.0", "5.1.0"),
+  },
+  {
+    path: ".codex-plugin/mcp.json",
+    manifest: codexServerConfig("6.0.0", "5.1.0"),
+  },
+])("reads the release pin from $path", async ({ path, manifest }) => {
+  const f = await fixture();
+  await candidate(f, "6.0.0");
+  await writeFile(join(f.directory, path), JSON.stringify(manifest));
+  await git(f.directory, ["add", "."]);
+  await git(f.directory, ["commit", "-m", "chore: stale plugin launch"]);
+  await expect(verify(f)).rejects.toMatchObject({
+    code: 1,
+    stderr: expect.stringContaining(
+      `launches version 5.1.0; release branch requires 6.0.0`,
+    ),
+  });
+});
+
 it("checks a publish merge using its pre-release first parent baseline", async () => {
   const f = await fixture();
   const sourceSha = await candidate(f, "6.0.0");
@@ -599,9 +728,8 @@ it.skipIf(process.platform === "win32").each([
     const sourceSha = await candidate(f, valid ? "6.0.0" : "5.1.0");
     const workflow = z
       .object({
-        jobs: z.record(
-          z.string(),
-          z.object({
+        jobs: z.object({
+          [job]: z.object({
             steps: z.array(
               z.object({
                 name: z.string().optional(),
@@ -609,7 +737,7 @@ it.skipIf(process.platform === "win32").each([
               }),
             ),
           }),
-        ),
+        }),
       })
       .parse(
         parse(

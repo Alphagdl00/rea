@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
 from website import NOTES_FIXTURES, SITE_ORIGIN, authored_markdown, page_url, sync_pages
+from website_i18n import is_language_code
 
 LEGACY_ORIGIN = "morluto.github.io"
 SITE_TEXT_URL = re.compile(
@@ -44,6 +45,7 @@ def markdown_ids(path):
 
 def check_repository_links(root):
     """Check local links in website Markdown and current-repository source links."""
+    root = root.resolve()
     errors = []
     sources = {}
     for path in authored_markdown(root):
@@ -95,6 +97,9 @@ class HtmlReferences(HTMLParser):
         self.properties = {}
         self.canonicals = []
         self.lang = None
+        self.direction = None
+        self.translation_fallback = False
+        self.alternates = {}
         self.h1_count = 0
         self.text = []
         self.copy_targets = []
@@ -103,11 +108,18 @@ class HtmlReferences(HTMLParser):
         attributes = dict(attrs)
         if tag == "html":
             self.lang = attributes.get("lang")
+            self.direction = attributes.get("dir")
+            self.translation_fallback = attributes.get("data-translation-fallback") == "true"
         if tag == "h1":
             self.h1_count += 1
         if tag == "head":
             self.in_head = True
         if self.in_head:
+            if tag == "link" and attributes.get("rel") == "alternate" and attributes.get("hreflang"):
+                language = attributes["hreflang"]
+                if language in self.alternates:
+                    self.duplicate_ids.append("hreflang:" + language)
+                self.alternates[language] = attributes.get("href") or ""
             if tag == "title":
                 self.titles.append("")
                 self.in_title = True
@@ -167,8 +179,17 @@ def check_search_metadata(site, pages):
         title = page.titles[0].strip() if len(page.titles) == 1 else ""
         if not title:
             errors.append(f"{label}: needs exactly one nonempty head title")
-        if page.lang != "en" or page.h1_count != 1:
-            errors.append(f"{label}: needs lang=en and exactly one h1")
+        first = path.relative_to(site).parts[0]
+        expected_language = first if is_language_code(first) else "en"
+        if page.translation_fallback:
+            if page.lang != "en" or not page.noindex():
+                errors.append(f"{label}: English translation fallback needs lang=en and noindex")
+        elif page.lang != expected_language:
+            errors.append(f"{label}: needs lang={expected_language} and exactly one h1")
+        if page.h1_count != 1:
+            errors.append(f"{label}: needs exactly one h1")
+        if expected_language in ("ar", "fa") and not page.translation_fallback and page.direction != "rtl":
+            errors.append(f"{label}: needs dir=rtl")
         if label in NOTES_FIXTURES and not page.noindex():
             errors.append(
                 f"{label}: example application must have a head noindex directive"
@@ -179,9 +200,10 @@ def check_search_metadata(site, pages):
         indexable.add(url)
         if page.canonicals != [url]:
             errors.append(f"{label}: needs exactly one head canonical for {url}")
-        if title in titles:
+        title_identity = (page.lang, title)
+        if title_identity in titles:
             errors.append(f"{label}: duplicate search title {title!r}")
-        titles.add(title)
+        titles.add(title_identity)
         descriptions = page.meta.get("description", [])
         description = descriptions[0].strip() if len(descriptions) == 1 else ""
         if not description:
@@ -219,6 +241,22 @@ def check_search_metadata(site, pages):
             values = collection.get(key, [])
             if len(values) != 1 or not values[0].strip():
                 errors.append(f"{label}: needs exactly one nonempty {key}")
+        if page.alternates:
+            if page.alternates.get(page.lang) != url:
+                errors.append(f"{label}: hreflang must include its own canonical")
+            for language, target in page.alternates.items():
+                parsed = urlsplit(target)
+                if parsed.scheme != "https" or parsed.netloc != "rea.tools":
+                    errors.append(f"{label}: hreflang needs absolute rea.tools URLs")
+                    continue
+                target_path = (site / unquote(parsed.path).lstrip("/")).resolve()
+                if target_path.is_dir():
+                    target_path /= "index.html"
+                other = pages.get(target_path)
+                if other is None or other.noindex() or other.alternates != page.alternates:
+                    errors.append(f"{label}: nonreciprocal or nonindexable hreflang: {target}")
+                elif language != "x-default" and other.lang != language:
+                    errors.append(f"{label}: hreflang={language} points to lang={other.lang}")
 
     sitemap_path = site / "sitemap.xml"
     try:
@@ -282,6 +320,7 @@ def check_search_metadata(site, pages):
 
 def check_site(site):
     """Check assets, HTML fragment destinations and SVG syntax."""
+    site = site.resolve()
     pages = {}
     errors = []
     references = 0
@@ -290,7 +329,7 @@ def check_site(site):
         parser.feed(path.read_text(encoding="utf-8"))
         pages[path] = parser
     if site / "index.html" not in pages:
-        errors.append("website/public/index.html is missing")
+        errors.append(f"{site}/index.html is missing; run scripts/prepare-website.py")
 
     for path, page in pages.items():
         label = path.relative_to(site)
@@ -400,8 +439,8 @@ def check_example_archive(site):
 def main():
     """Run the same checks locally, on website PRs and before publishing."""
     root = Path(__file__).resolve().parent.parent
-    pages, references, indexable, errors = check_site(root / "website/public")
-    errors.extend(check_example_archive(root / "website/public"))
+    pages, references, indexable, errors = check_site(root / "website/_site")
+    errors.extend(check_example_archive(root / "website/_site"))
     errors.extend(check_publisher(root))
     errors.extend(check_repository_links(root))
     try:

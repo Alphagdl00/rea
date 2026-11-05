@@ -1,12 +1,13 @@
+import { moduleResolutionModeForJavaScriptReference } from "../domain/javascript/javascriptModuleResolutionMode.js";
 import { parseJavaScriptSource } from "../domain/javascript/javascriptSourceParser.js";
 import { analyzeParsedJavaScriptStaticSourceSteps } from "../domain/javascript/javascriptStaticAnalysis.js";
-import {
-  analyzeParsedJavaScriptSemanticsSteps,
-  classifyParsedJavaScriptOpenReceiversSteps,
-} from "../domain/javascript/javascriptSemanticAnalysis.js";
+import { analyzeParsedJavaScriptSemanticsSteps } from "../domain/javascript/javascriptSemanticAnalysis.js";
 import { failedJavaScriptStaticAnalysis } from "../domain/javascript/javascriptStaticAnalysisHelpers.js";
 import { projectJavaScriptModuleSemantics } from "../domain/javascript/javascriptModuleSemanticIr.js";
-import { measureJavaScriptModuleTransfer } from "../javascript/analysis/JavaScriptAnalysisTransfer.js";
+import {
+  javaScriptTransferByteBudget,
+  measureJavaScriptModuleTransfer,
+} from "../javascript/analysis/JavaScriptAnalysisTransfer.js";
 import { AnalysisResourceConstraintError } from "../domain/analysisErrorCore.js";
 import { projectJavaScriptSemanticFileSteps } from "../application/javascript/JavaScriptSemanticGraphBuilder.js";
 import { completeJavaScriptAnalysisSteps } from "../application/javascript/JavaScriptAnalysisControl.js";
@@ -17,7 +18,7 @@ import {
 
 const analyze: JavaScriptSourceWorkerAnalyzer = async (
   file,
-  nodeBudget,
+  capacity,
   callbacks,
 ) => {
   if (!file.text.included)
@@ -29,15 +30,8 @@ const analyze: JavaScriptSourceWorkerAnalyzer = async (
     return null;
   }
   await callbacks.phase("static");
-  const receivers = await completeJavaScriptAnalysisSteps(
-    classifyParsedJavaScriptOpenReceiversSteps(parsed),
-  );
   const facts = await completeJavaScriptAnalysisSteps(
-    analyzeParsedJavaScriptStaticSourceSteps(
-      file.text.value,
-      parsed,
-      receivers,
-    ),
+    analyzeParsedJavaScriptStaticSourceSteps(file.text.value, parsed),
   );
   const resultBudgetBytes = await callbacks.checkpoint(facts);
   if (facts.parse_status === "failed") return null;
@@ -50,11 +44,18 @@ const analyze: JavaScriptSourceWorkerAnalyzer = async (
     );
   await callbacks.phase("semantic");
   const ir = await completeJavaScriptAnalysisSteps(
-    analyzeParsedJavaScriptSemanticsSteps(parsed),
+    analyzeParsedJavaScriptSemanticsSteps(
+      parsed,
+      moduleResolutionModeForJavaScriptReference(file.path, "static-import"),
+      capacity.nodes,
+    ),
   );
   parsed = null;
   const module = projectJavaScriptModuleSemantics(ir);
-  const measured = measureJavaScriptModuleTransfer(module);
+  const measured = measureJavaScriptModuleTransfer(
+    module,
+    javaScriptTransferByteBudget(resultBudgetBytes),
+  );
   if (measured.retentionBytes > resultBudgetBytes)
     throw new AnalysisResourceConstraintError(
       "analyze_javascript_application",
@@ -67,7 +68,12 @@ const analyze: JavaScriptSourceWorkerAnalyzer = async (
     );
   await callbacks.phase("projection");
   const projection = await completeJavaScriptAnalysisSteps(
-    projectJavaScriptSemanticFileSteps(file, ir, nodeBudget),
+    projectJavaScriptSemanticFileSteps(
+      file,
+      ir,
+      capacity,
+      facts.electron.call_paths,
+    ),
   );
   return { module, projection };
 };

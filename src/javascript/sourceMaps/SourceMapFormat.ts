@@ -1,6 +1,13 @@
 import { z } from "zod";
 import { WEB_SOURCE_MAP_LIMITS } from "../../domain/webSourceLocation.js";
-import { hasValidSourceMapContents } from "../../domain/sourceMapContents.js";
+import {
+  classifySourceMapSection,
+  classifySourceMapSections,
+  sourceMapJsonText,
+  sourceMapMappingsSchema,
+} from "../../domain/sourceMapEnvelope.js";
+import type { SourceMapSection } from "../../domain/sourceMapEnvelope.js";
+import type { EncodedSourceMapXInput } from "@jridgewell/trace-mapping";
 
 const leafSchema = z.object({
   version: z.literal(3),
@@ -9,9 +16,9 @@ const leafSchema = z.object({
   sources: z.array(z.string().nullable()),
   sourcesContent: z.array(z.string().nullable()).nullable().optional(),
   names: z.array(z.string()).default([]),
-  mappings: z.string().regex(/^[A-Za-z0-9+/,;]*$/u),
-  ignoreList: z.array(z.number().int().min(0)).optional(),
-  x_google_ignoreList: z.array(z.number().int().min(0)).optional(),
+  mappings: sourceMapMappingsSchema.regex(/^[A-Za-z0-9+/,;]*$/u),
+  ignoreList: z.array(z.int().min(0)).optional(),
+  x_google_ignoreList: z.array(z.int().min(0)).optional(),
 });
 const mapHeaderSchema = z.object({
   version: z.literal(3),
@@ -20,17 +27,12 @@ const mapHeaderSchema = z.object({
 });
 const sectionSchema = z.object({
   offset: z.object({
-    line: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
-    column: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    line: z.int().min(0).max(Number.MAX_SAFE_INTEGER),
+    column: z.int().min(0).max(Number.MAX_SAFE_INTEGER),
   }),
   map: z.unknown().optional(),
-  url: z.string().optional(),
+  url: z.unknown().optional(),
 });
-const indexedSchema = z.object({
-  version: z.literal(3),
-  sections: z.array(sectionSchema),
-});
-
 type Offset = { readonly line: number; readonly column: number };
 interface PendingMap {
   readonly value: unknown;
@@ -53,7 +55,7 @@ export interface SourceMapStructureOptions {
 /** A decoder-profile failure with an actionable producer constraint. */
 export class SourceMapFormatFailure extends Error {
   constructor(
-    readonly reason: "format" | "unsupported" | "limit",
+    readonly reason: "format" | "unsupported" | "limit" | "section-overlap",
     message: string,
   ) {
     super(message);
@@ -73,9 +75,26 @@ export interface SourceMapSourceDeclaration {
 /** Validated leaf with absolute first-line offsets and its enclosing section boundary. */
 export interface SourceMapLeaf {
   readonly map: z.output<typeof leafSchema>;
+  readonly codecMap: EncodedSourceMapXInput;
   readonly offset: Offset;
   readonly stop: Offset | null;
 }
+
+const codecLeaf = (
+  map: z.output<typeof leafSchema>,
+): EncodedSourceMapXInput => ({
+  version: 3,
+  ...(map.file === undefined ? {} : { file: map.file }),
+  ...(typeof map.sourceRoot === "string" ? { sourceRoot: map.sourceRoot } : {}),
+  sources: map.sources,
+  ...(map.sourcesContent == null ? {} : { sourcesContent: map.sourcesContent }),
+  names: map.names,
+  mappings: map.mappings,
+  ...(map.ignoreList === undefined ? {} : { ignoreList: map.ignoreList }),
+  ...(map.x_google_ignoreList === undefined
+    ? {}
+    : { x_google_ignoreList: map.x_google_ignoreList }),
+});
 
 const compare = (a: Offset, b: Offset): number =>
   a.line - b.line || a.column - b.column;
@@ -105,43 +124,56 @@ const consumeRecords = (budget: { records: number }, count: number): void => {
   budget.records += count;
 };
 
-const addSections = (
-  node: PendingMap,
-  pending: PendingMap[],
-  budget: { records: number },
-  options: SourceMapStructureOptions,
-): void => {
+const addSections = ({
+  node,
+  pending,
+  rawSections,
+  budget,
+  options,
+}: {
+  readonly node: PendingMap;
+  readonly pending: PendingMap[];
+  readonly rawSections: readonly unknown[];
+  readonly budget: { records: number };
+  readonly options: SourceMapStructureOptions;
+}): void => {
   options.check?.();
-  const header = mapHeaderSchema.parse(node.value);
-  if (!Array.isArray(header.sections))
-    throw new SourceMapFormatFailure(
-      "format",
-      "Indexed source-map sections must be an array.",
-    );
-  consumeRecords(budget, header.sections.length);
-  const sections = indexedSchema.parse(node.value).sections;
+  consumeRecords(budget, rawSections.length);
+  const sections = z.array(sectionSchema).parse(rawSections);
+  const embeddedMaps: Extract<
+    SourceMapSection,
+    { readonly kind: "embedded" }
+  >["map"][] = [];
   for (const [index, section] of sections.entries()) {
     if ((index & 255) === 0) options.check?.();
     const previous = sections[index - 1];
-    if (previous !== undefined && compare(section.offset, previous.offset) <= 0)
+    if (previous !== undefined && compare(section.offset, previous.offset) < 0)
       throw new SourceMapFormatFailure(
         "format",
-        "Indexed section offsets must be strictly increasing.",
+        "Indexed section offsets must be in nondecreasing order.",
       );
-    if (section.url !== undefined)
+    const classification = classifySourceMapSection(section);
+    if (classification.kind === "external")
       throw new SourceMapFormatFailure(
         "unsupported",
-        `External source-map section URL is not fetched: ${section.url}`,
+        `External source-map section URL is not fetched: ${classification.url}`,
       );
-    if (section.map === undefined)
+    if (classification.kind === "invalid")
       throw new SourceMapFormatFailure(
         "format",
-        "Indexed section requires an embedded map.",
+        `${classification.reason} Section path: ${JSON.stringify([...node.path, index])}.`,
       );
+    embeddedMaps.push(classification.map);
   }
   for (let index = sections.length - 1; index >= 0; index -= 1) {
     const section = sections[index];
     if (section === undefined) continue;
+    const map = embeddedMaps[index];
+    if (map === undefined)
+      throw new SourceMapFormatFailure(
+        "format",
+        "Validated indexed section map is unavailable.",
+      );
     const next = sections[index + 1];
     const nextOffset =
       next === undefined ? null : addOffset(node.offset, next.offset);
@@ -152,13 +184,8 @@ const addSections = (
           ? nextOffset
           : node.stop;
     const offset = addOffset(node.offset, section.offset);
-    if (node.stop !== null && compare(offset, node.stop) >= 0)
-      throw new SourceMapFormatFailure(
-        "format",
-        "Nested source-map section overlaps its enclosing boundary.",
-      );
     pending.push({
-      value: section.map,
+      value: map,
       path: [...node.path, index],
       offset,
       stop,
@@ -248,23 +275,6 @@ const inspectLeaf = (
   consumeRecords(budget, Array.isArray(rawNames) ? rawNames.length : 0);
   consumeRecords(budget, Array.isArray(rawContents) ? rawContents.length : 0);
   options.check?.();
-  if (options.profile === "browser-collection" && !Array.isArray(rawNames))
-    throw new SourceMapFormatFailure(
-      "format",
-      "Source-map leaf requires a names array.",
-    );
-  if (
-    options.profile === "browser-collection" &&
-    !hasValidSourceMapContents(
-      Array.isArray(rawSources) ? rawSources.length : 0,
-      rawContents,
-    )
-  )
-    throw new SourceMapFormatFailure(
-      "format",
-      "Source-map sourcesContent must align with its source declarations.",
-    );
-  options.check?.();
   const leaf = leafSchema.parse(node.value);
   const layout = inspectMappingLayout(leaf.mappings, options.check);
   consumeRecords(budget, layout.segments + layout.lines);
@@ -279,47 +289,13 @@ const inspectLeaf = (
   return leaf;
 };
 
-/**
- * Return the JSON view of source-map text without changing the source evidence.
- * ECMA-426 §11.2.1 permits HTTP(S) responses to start with `)]}'`; the line
- * through the first HTTP newline is transport framing, not map content. Local
- * point tracing shares this parser and has historically accepted the same
- * framing. https://tc39.es/ecma426/#sec-fetchsourcemap
- */
-export const sourceMapJsonText = (text: string): string => {
-  const withoutBom = text.replace(/^\uFEFF/u, "");
-  if (!withoutBom.startsWith(")]}'")) return withoutBom;
-  const newline = withoutBom.search(/[\r\n]/u);
-  return newline === -1 ? "" : withoutBom.slice(newline);
-};
-
 /** Validate structure before allocation, retaining raw declarations and section boundaries. */
 export const inspectSourceMap = (
   text: string,
-): {
-  readonly jsonText: string;
-  readonly format: "regular" | "indexed";
-  readonly reportedFile: string | null;
-  readonly declarations: readonly SourceMapSourceDeclaration[];
-  readonly leaves: readonly SourceMapLeaf[];
-} => {
+): ReturnType<typeof inspectSourceMapValue> => {
   const jsonText = sourceMapJsonText(text);
   const value: unknown = JSON.parse(jsonText);
-  const inspected = inspectSourceMapValue(value);
-  const normalized =
-    inspected.format === "regular"
-      ? inspected.leaves[0]?.map
-      : {
-          version: 3,
-          sections: inspected.leaves.map((leaf) => ({
-            offset: leaf.offset,
-            map: leaf.map,
-          })),
-        };
-  return {
-    jsonText: JSON.stringify(normalized),
-    ...inspected,
-  };
+  return inspectSourceMapValue(value);
 };
 
 /** Return validated leaves when a consumer needs decoded rows after preflight. */
@@ -349,13 +325,30 @@ export const inspectSourceMapValue = (
         "limit",
         "Indexed source-map nesting exceeds the 64-level decoder stack budget.",
       );
-    if (mapHeaderSchema.parse(node.value).sections !== undefined) {
-      addSections(node, pending, budget, options);
+    const sections = classifySourceMapSections(node.value);
+    if (sections.kind === "invalid")
+      throw new SourceMapFormatFailure("format", sections.reason);
+    if (sections.kind === "indexed") {
+      addSections({
+        node,
+        pending,
+        rawSections: sections.sections,
+        budget,
+        options,
+      });
       continue;
     }
     const leaf = inspectLeaf(node, budget, options);
-    leaves.push({ map: leaf, offset: node.offset, stop: node.stop });
-    if (options.profile !== "browser-collection")
+    leaves.push({
+      map: leaf,
+      codecMap: codecLeaf(leaf),
+      offset: node.offset,
+      stop: node.stop,
+    });
+    if (options.profile !== "browser-collection") {
+      const ignoredSources = new Set(
+        leaf.ignoreList ?? leaf.x_google_ignoreList ?? [],
+      );
       for (const [sourceIndex, source] of leaf.sources.entries())
         declarations.push({
           sectionPath: node.path,
@@ -363,10 +356,9 @@ export const inspectSourceMapValue = (
           source,
           root: leaf.sourceRoot ?? null,
           content: leaf.sourcesContent?.[sourceIndex] ?? null,
-          ignored: (leaf.ignoreList ?? leaf.x_google_ignoreList ?? []).includes(
-            sourceIndex,
-          ),
+          ignored: ignoredSources.has(sourceIndex),
         });
+    }
   }
   return {
     format: root.sections === undefined ? "regular" : "indexed",

@@ -1,19 +1,21 @@
-import { Readable } from "node:stream";
+import { createHash } from "node:crypto";
 import { symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 
 import { expect, it } from "vitest";
 
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
 import {
+  analyzeJavaScriptApplication,
   reconstructJavaScriptArtifact,
   readJavaScriptArtifactFiles,
 } from "../../support/javascriptApplicationScope.js";
 import { scanArtifactInventory } from "../../fixtures/artifactInventory.js";
-import {
-  type ArtifactEntry,
-  type ArtifactReader,
+import type {
+  ArtifactEntry,
+  ArtifactReader,
 } from "../../../src/artifacts/ArtifactReader.js";
 import { writeJavaScriptArtifactFixture } from "../../fixtures/javascriptArtifactApplication.js";
 
@@ -67,6 +69,7 @@ it("keeps malformed JavaScript, package metadata, and source maps as explicit un
   await Promise.all([
     writeFile(join(root, "package.json"), "{"),
     writeFile(join(root, "broken.js"), "function broken( {"),
+    writeFile(join(root, "data.json"), "{"),
     writeFile(join(root, "renderer", "renderer.js.map"), "{"),
   ]);
 
@@ -89,9 +92,33 @@ it("keeps malformed JavaScript, package metadata, and source maps as explicit un
     expect.arrayContaining([
       "parse-javascript",
       "parse-package-json",
+      "parse-json-module",
       "parse-local-source-map",
     ]),
   );
+  const gaps = result.graph.nodes
+    .filter(({ kind }) => kind === "unknown")
+    .flatMap(({ observations }) => observations);
+  for (const operation of [
+    "parse-javascript",
+    "parse-package-json",
+    "parse-json-module",
+    "parse-local-source-map",
+  ]) {
+    const applicable = gaps.filter(
+      ({ properties }) => properties.operation === operation,
+    );
+    expect(applicable.length).toBeGreaterThan(0);
+    for (const gap of applicable)
+      expect(gap.evidence).toMatchObject({
+        authority:
+          operation === "parse-javascript"
+            ? "ast-static-analysis"
+            : "artifact-bytes",
+        state: "unavailable",
+        confidence: "unknown",
+      });
+  }
 });
 
 it("retains every source declared by every included local source map", async () => {
@@ -134,7 +161,6 @@ it("retains every source declared by every included local source map", async () 
 it.each([
   ["a non-array sourcesContent value", { sourcesContent: "source" }],
   ["a non-string, non-null source entry", { sourcesContent: [42] }],
-  ["a source-content array with the wrong length", { sourcesContent: [] }],
 ])(
   "reports %s as an invalid local source map",
   async (_description, content) => {
@@ -187,7 +213,7 @@ it("accepts omitted and explicitly null source-map source contents", async () =>
       JSON.stringify({
         version: 3,
         sources: ["null.ts"],
-        sourcesContent: [null],
+        sourcesContent: null,
         names: [],
         mappings: "",
       }),
@@ -206,6 +232,122 @@ it("accepts omitted and explicitly null source-map source contents", async () =>
         observations[0]?.properties.content_available === false,
     ),
   ).toBe(true);
+  expect(result.graph.coverage.status).toBe("complete");
+});
+
+it.each([
+  ["shorter", ["export const answer = 42;"]],
+  ["longer", ["export const answer = 42;", null, "unused trailing content"]],
+])(
+  "keeps every source declaration when sourcesContent is %s than sources",
+  async (length, sourcesContent) => {
+    const root = await createTestTempDirectory(
+      `rea-javascript-${length}-source-content-`,
+    );
+    await writeFile(
+      join(root, "bundle.js.map"),
+      JSON.stringify({
+        version: 3,
+        sources: ["a.ts", "b.ts"],
+        sourcesContent,
+        names: [],
+        mappings: "AAAA;ACAA",
+      }),
+    );
+
+    const result = await reconstructJavaScriptArtifact({ input_path: root });
+    const originals = result.graph.nodes.filter(
+      ({ identity }) => identity.strategy === "source-map-original",
+    );
+
+    expect(
+      originals
+        .map(({ identity, observations }) => ({
+          original_source:
+            "original_source" in identity ? identity.original_source : null,
+          source_index: observations[0]?.properties.source_index,
+          content_available: observations[0]?.properties.content_available,
+        }))
+        .sort(
+          (left, right) =>
+            Number(left.source_index) - Number(right.source_index),
+        ),
+    ).toEqual([
+      { original_source: "a.ts", source_index: 0, content_available: true },
+      { original_source: "b.ts", source_index: 1, content_available: false },
+    ]);
+    expect(result.graph.coverage.status).toBe("complete");
+  },
+);
+
+it("retains unnamed source declarations without shifting later source evidence", async () => {
+  const root = await createTestTempDirectory("rea-javascript-unnamed-source-");
+  const text = JSON.stringify({
+    version: 3,
+    sections: [
+      {
+        offset: { line: 0, column: 0 },
+        map: {
+          version: 3,
+          sources: ["prior.ts"],
+          sourcesContent: ["export const prior = 1;"],
+          names: [],
+          mappings: "",
+        },
+      },
+      {
+        offset: { line: 1, column: 0 },
+        map: {
+          version: 3,
+          sources: [null, "original.ts"],
+          sourcesContent: [null, "export const answer: number = 42;"],
+          names: [],
+          mappings: "ACAA",
+        },
+      },
+    ],
+  });
+  await writeFile(join(root, "bundle.js.map"), text);
+
+  const result = await reconstructJavaScriptArtifact({ input_path: root });
+  const nodes = result.graph.nodes;
+  const original = nodes.find(
+    ({ kind, identity }) =>
+      kind === "source-module" &&
+      identity.strategy === "source-map-original" &&
+      identity.original_source === "original.ts",
+  );
+  const unnamed = nodes.find(
+    ({ kind, observations }) =>
+      kind === "unknown" &&
+      observations.some(
+        ({ properties }) => properties.source_name_available === false,
+      ),
+  );
+
+  expect(original?.identity).toMatchObject({
+    strategy: "source-map-original",
+    source_sha256: createHash("sha256")
+      .update("export const answer: number = 42;")
+      .digest("hex"),
+  });
+  expect(original?.observations[0]?.properties).toMatchObject({
+    source_index: 1,
+    declaration_index: 2,
+    content_available: true,
+  });
+  expect(unnamed?.observations[0]?.properties).toMatchObject({
+    source_index: 0,
+    declaration_index: 1,
+    source_name_available: false,
+    content_available: false,
+    content_sha256: null,
+  });
+  expect(unnamed?.identity).toMatchObject({
+    strategy: "artifact-local-key",
+    namespace: "source-map-unnamed-declaration",
+    key: "1",
+  });
   expect(result.graph.coverage.status).toBe("complete");
 });
 
@@ -243,6 +385,35 @@ it("retains every repeated content observation and containment path", async () =
   });
 }, 15_000);
 
+it("rejects NUL paths through the public request contract before reconstruction", async () => {
+  const input = { input_path: "invalid\u0000.asar" };
+  await expect(reconstructJavaScriptArtifact(input)).rejects.toMatchObject({
+    name: "ZodError",
+    issues: [
+      {
+        code: "invalid_format",
+        path: ["input_path"],
+        message: "Local filesystem paths cannot contain NUL",
+      },
+    ],
+  });
+
+  const result = await analyzeJavaScriptApplication(input);
+  if (result.ok) throw new Error("Expected invalid input path");
+  expect(result.error).toMatchObject({
+    _tag: "AnalysisInputError",
+    operation: "analyze_javascript_application",
+    issues: [
+      {
+        path: ["input_path"],
+        reason: "invalid_format",
+        expected: "regex",
+        message: "Local filesystem paths cannot contain NUL",
+      },
+    ],
+  });
+});
+
 it("rejects traversal from a production reader seam and malformed ASAR containers", async () => {
   const root = await fixtureDirectory();
   const snapshot = await scanArtifactInventory(root);
@@ -263,10 +434,14 @@ it("rejects traversal from a production reader seam and malformed ASAR container
 it("preserves cancellation and explicit format diagnostics", async () => {
   const root = await fixtureDirectory();
   const controller = new AbortController();
-  controller.abort();
-  await expect(
-    reconstructJavaScriptArtifact({ input_path: root }, controller.signal),
-  ).rejects.toMatchObject({ reason: "cancelled" });
+  const reason = Object.freeze({ requested: "reconstruction-stop" });
+  controller.abort(reason);
+  const cancelled: unknown = await reconstructJavaScriptArtifact(
+    { input_path: root },
+    controller.signal,
+  ).catch((caught: unknown) => caught);
+  expect(cancelled).toMatchObject({ reason: "cancelled" });
+  expect((cancelled as { cause?: unknown }).cause).toBe(reason);
   await expect(
     reconstructJavaScriptArtifact({ input_path: root, format: "asar" }),
   ).rejects.toMatchObject({
@@ -292,7 +467,7 @@ class TraversalReader implements ArtifactReader {
       executable: false,
       encrypted: false,
       byteOffset: null,
-      declaredSha256: null,
+      declaredIntegrity: null,
       unpacked: false,
       limitations: [],
       adapterKey: "/tmp/escape.js",

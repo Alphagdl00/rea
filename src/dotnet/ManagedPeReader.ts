@@ -1,4 +1,14 @@
+import { observeMzWindowsHeader } from "../domain/dosMz.js";
+import {
+  readPeOptionalHeaderFixedFields,
+  readPeOptionalHeaderDirectory,
+  type PeOptionalHeaderFixedFields,
+} from "../domain/peOptionalHeader.js";
+import { readPeSectionHeader } from "../domain/peSectionHeader.js";
 import type { ManagedParseIssue } from "../domain/managed/managedArtifact.js";
+import { readPeCoffHeader } from "../domain/peCoffHeader.js";
+import { decodePeMachine } from "../domain/peMachine.js";
+import { readManagedCliHeaderPrefix } from "../domain/managed/managedCliHeaderPrefix.js";
 import {
   managedFailure,
   ManagedReaderFailure,
@@ -30,6 +40,27 @@ export interface ManagedCliHeader {
   readonly readyToRunSignature: boolean;
 }
 
+/**
+ * How the CLI header constrains process bitness. 32BITREQUIRED and
+ * 32BITPREFERRED are one two-bit field: required alone is x86-only, both set
+ * is platform-neutral code that prefers a 32-bit process, and preferred alone
+ * is reserved and constrains nothing.
+ */
+export const managedCli32BitRequirement = (
+  flags: number,
+): "required" | "preferred" | "none" => {
+  const pair = flags & 0x0002_0002;
+  if (pair === 0x0000_0002) return "required";
+  return pair === 0x0002_0002 ? "preferred" : "none";
+};
+
+/**
+ * crossgen2 clears ILONLY on ReadyToRun output, so only a clear ILONLY flag
+ * without the ReadyToRun signature marks mixed CLR/native code.
+ */
+export const managedCliIsMixedClrNative = (cli: ManagedCliHeader): boolean =>
+  (cli.flags & 0x0000_0001) === 0 && !cli.readyToRunSignature;
+
 export interface ManagedPeLayout {
   readonly machine: number;
   readonly architecture: "x86" | "x86_64" | "arm" | "arm64";
@@ -38,10 +69,13 @@ export interface ManagedPeLayout {
   readonly characteristics: number;
   readonly sections: readonly PeSection[];
   readonly cli: ManagedCliHeader | null;
-  readonly cliDirectoryPresent: boolean;
+  readonly cliDirectoryState: "absent" | "present" | "unreadable";
   readonly cliIssue: ManagedParseIssue | null;
   rvaToOffset(rva: number, size: number, scope: string): number;
-  rvaAvailableBytes(rva: number, scope: string): number;
+  rvaFileRange(
+    rva: number,
+    scope: string,
+  ): { readonly offset: number; readonly available: number };
 }
 
 interface RvaMapping {
@@ -63,9 +97,13 @@ interface CoffHeader {
 interface OptionalHeader {
   readonly optionalOffset: number;
   readonly optionalHeader: "pe32" | "pe32-plus";
-  readonly directoryCountOffset: number;
-  readonly directoryOffset: number;
+  readonly fixed: PeOptionalHeaderFixedFields;
 }
+
+type CliDirectoryRead =
+  | { readonly kind: "absent" }
+  | { readonly kind: "present"; readonly directory: PeDataDirectory }
+  | { readonly kind: "unreadable"; readonly issue: ManagedParseIssue };
 
 const requireRange = (
   bytes: Buffer,
@@ -100,25 +138,18 @@ const add = (left: number, right: number, scope: string): number => {
   return result;
 };
 
-const architectureFor = (machine: number): ManagedPeLayout["architecture"] => {
-  switch (machine) {
-    case 0x014c:
-      return "x86";
-    case 0x8664:
-      return "x86_64";
-    case 0x01c0:
-    case 0x01c2:
-    case 0x01c4:
-      return "arm";
-    case 0xaa64:
-      return "arm64";
-    default:
-      throw managedFailure(
-        "invalid-directory",
-        "pe.machine",
-        `Unsupported PE machine 0x${machine.toString(16).padStart(4, "0")}`,
-      );
-  }
+const architectureFor = (
+  machine: number,
+  managed: boolean,
+): ManagedPeLayout["architecture"] => {
+  const decoded = decodePeMachine(machine);
+  if (decoded === undefined || (decoded.nativeOsOverride && !managed))
+    throw managedFailure(
+      "invalid-directory",
+      "pe.machine",
+      `Unsupported PE machine 0x${machine.toString(16).padStart(4, "0")}`,
+    );
+  return decoded.architecture;
 };
 
 /** Resolve one section identity for both exact reads and available-byte queries. */
@@ -224,7 +255,17 @@ const readCliHeader = (
     size: 72,
     scope: "cli.header",
   });
-  const headerSize = bytes.readUInt32LE(offset);
+  const prefix = readManagedCliHeaderPrefix(
+    bytes.subarray(offset, offset + 16),
+  );
+  if (!prefix.ok)
+    throw managedFailure(
+      "invalid-cli-header",
+      "cli.header",
+      prefix.error.message,
+      offset,
+    );
+  const { headerSize, runtimeMajor, runtimeMinor, metadata } = prefix.value;
   if (headerSize < 72 || headerSize > directory.size)
     throw managedFailure(
       "invalid-cli-header",
@@ -232,7 +273,6 @@ const readCliHeader = (
       "CLI header size is outside its PE data directory",
       offset,
     );
-  const metadata = readDirectory(bytes, offset + 8);
   if (metadata.rva === 0 || metadata.size === 0)
     throw managedFailure(
       "invalid-cli-header",
@@ -256,8 +296,8 @@ const readCliHeader = (
   return {
     headerOffset: offset,
     headerSize,
-    runtimeMajor: bytes.readUInt16LE(offset + 4),
-    runtimeMinor: bytes.readUInt16LE(offset + 6),
+    runtimeMajor,
+    runtimeMinor,
     metadata,
     flags,
     entryPoint: bytes.readUInt32LE(offset + 20),
@@ -269,18 +309,33 @@ const readCliHeader = (
 };
 
 const readCoffHeader = (bytes: Buffer): CoffHeader => {
-  const peOffset = bytes.readUInt32LE(0x3c);
-  requireRange(bytes, peOffset, 24, "pe.coff-header");
-  if (bytes.readUInt32LE(peOffset) !== 0x0000_4550)
+  const observed = observeMzWindowsHeader(bytes);
+  if (observed.state === "candidate" || observed.state === "signature-needed")
+    requireRange(bytes, observed.offset, 24, "pe.coff-header");
+  if (observed.state !== "declared" || observed.signature !== "PE")
     throw managedFailure(
       "invalid-directory",
       "pe.signature",
-      "PE signature is invalid",
+      "MZ header does not declare a PE image",
+      0x3c,
+    );
+  const peOffset = observed.offset;
+  requireRange(bytes, peOffset, 24, "pe.coff-header");
+  const coff = peOffset + 4;
+  const parsed = readPeCoffHeader(bytes.subarray(coff, coff + 20));
+  if (!parsed.ok)
+    throw managedFailure(
+      "invalid-directory",
+      "pe.coff-header",
+      parsed.error.message,
       peOffset,
     );
-  const coff = peOffset + 4;
-  const machine = bytes.readUInt16LE(coff);
-  const sectionCount = bytes.readUInt16LE(coff + 2);
+  const {
+    machine,
+    sectionCount,
+    optionalHeaderSize: optionalSize,
+    characteristics,
+  } = parsed.value;
   if (sectionCount === 0)
     throw managedFailure(
       "invalid-directory",
@@ -288,8 +343,6 @@ const readCoffHeader = (bytes: Buffer): CoffHeader => {
       "PE section count must be positive",
       coff + 2,
     );
-  const optionalSize = bytes.readUInt16LE(coff + 16);
-  const characteristics = bytes.readUInt16LE(coff + 18);
   return { coff, machine, sectionCount, optionalSize, characteristics };
 };
 
@@ -306,10 +359,10 @@ const readOptionalHeader = (
       "PE optional header is too short",
       optionalOffset,
     );
-  const magic = bytes.readUInt16LE(optionalOffset);
-  const optionalHeader =
-    magic === 0x010b ? "pe32" : magic === 0x020b ? "pe32-plus" : undefined;
-  if (optionalHeader === undefined)
+  const parsed = readPeOptionalHeaderFixedFields(
+    bytes.subarray(optionalOffset, optionalOffset + coff.optionalSize),
+  );
+  if (!parsed.ok)
     throw managedFailure(
       "invalid-directory",
       "pe.optional-header",
@@ -318,10 +371,8 @@ const readOptionalHeader = (
     );
   return {
     optionalOffset,
-    optionalHeader,
-    directoryCountOffset:
-      optionalOffset + (optionalHeader === "pe32" ? 92 : 108),
-    directoryOffset: optionalOffset + (optionalHeader === "pe32" ? 96 : 112),
+    optionalHeader: parsed.value.format,
+    fixed: parsed.value,
   };
 };
 
@@ -339,11 +390,19 @@ const readSections = (
   const sections: PeSection[] = [];
   for (let index = 0; index < coff.sectionCount; index += 1) {
     const offset = sectionOffset + index * 40;
+    const parsed = readPeSectionHeader(bytes.subarray(offset, offset + 40));
+    if (!parsed.ok)
+      throw managedFailure(
+        "invalid-directory",
+        "pe.sections",
+        parsed.error.message,
+        offset,
+      );
     const section = {
-      virtualSize: bytes.readUInt32LE(offset + 8),
-      virtualAddress: bytes.readUInt32LE(offset + 12),
-      rawSize: bytes.readUInt32LE(offset + 16),
-      rawOffset: bytes.readUInt32LE(offset + 20),
+      virtualSize: parsed.value.virtual_size,
+      virtualAddress: parsed.value.virtual_address,
+      rawSize: parsed.value.raw_size,
+      rawOffset: parsed.value.offset,
     };
     if (section.rawSize > 0)
       requireRange(
@@ -361,15 +420,45 @@ const readCliDirectory = (
   bytes: Buffer,
   coff: CoffHeader,
   optional: OptionalHeader,
-): PeDataDirectory => {
-  requireRange(bytes, optional.directoryCountOffset, 4, "pe.data-directories");
-  const directoryCount = bytes.readUInt32LE(optional.directoryCountOffset);
-  if (
-    directoryCount <= 14 ||
-    coff.optionalSize < optional.directoryOffset - optional.optionalOffset + 120
-  )
-    return { rva: 0, size: 0 };
-  return readDirectory(bytes, optional.directoryOffset + 14 * 8);
+): CliDirectoryRead => {
+  const observed = readPeOptionalHeaderDirectory(
+    bytes.subarray(
+      optional.optionalOffset,
+      optional.optionalOffset + coff.optionalSize,
+    ),
+    optional.fixed,
+    14,
+  );
+  const countOffset =
+    optional.optionalOffset + optional.fixed.directoryCountOffset;
+  if (observed.state === "count-unavailable")
+    return {
+      kind: "unreadable",
+      issue: {
+        code: "invalid-directory",
+        scope: "pe.optional-header",
+        detail: "PE optional header does not contain its directory count",
+        offset: countOffset,
+      },
+    };
+  if (observed.state === "absent") return { kind: "absent" };
+  if (observed.state === "truncated")
+    return {
+      kind: "unreadable",
+      issue: {
+        code: "invalid-directory",
+        scope: "pe.data-directories",
+        detail: "PE data-directory count exceeds the optional-header extent",
+        offset: countOffset,
+      },
+    };
+  const directory = {
+    rva: observed.directory.address,
+    size: observed.directory.size,
+  };
+  return directory.rva !== 0 || directory.size !== 0
+    ? { kind: "present", directory }
+    : { kind: "absent" };
 };
 
 /** Parse the file-backed PE and CLI layout without loading target code. */
@@ -385,30 +474,32 @@ export const readManagedPeLayout = (bytes: Buffer): ManagedPeLayout => {
   const coff = readCoffHeader(bytes);
   const optional = readOptionalHeader(bytes, coff);
   const sections = readSections(bytes, coff, optional);
-  const cliDirectory = readCliDirectory(bytes, coff, optional);
-  const cliDirectoryPresent = cliDirectory.rva !== 0 || cliDirectory.size !== 0;
+  const cliDirectoryRead = readCliDirectory(bytes, coff, optional);
+  const cliDirectoryState = cliDirectoryRead.kind;
   let cli: ManagedCliHeader | null = null;
-  let cliIssue: ManagedParseIssue | null = null;
-  if (cliDirectoryPresent)
+  let cliIssue: ManagedParseIssue | null =
+    cliDirectoryRead.kind === "unreadable" ? cliDirectoryRead.issue : null;
+  if (cliDirectoryRead.kind === "present") {
     try {
-      cli = readCliHeader(bytes, sections, cliDirectory);
+      cli = readCliHeader(bytes, sections, cliDirectoryRead.directory);
     } catch (cause: unknown) {
       if (!(cause instanceof ManagedReaderFailure)) throw cause;
       cliIssue = cause.issue;
     }
+  }
   return {
     machine: coff.machine,
-    architecture: architectureFor(coff.machine),
+    architecture: architectureFor(coff.machine, cliDirectoryState !== "absent"),
     optionalHeader: optional.optionalHeader,
     sectionCount: coff.sectionCount,
     characteristics: coff.characteristics,
     sections,
     cli,
-    cliDirectoryPresent,
+    cliDirectoryState,
     cliIssue,
     rvaToOffset: (rva, size, scope) =>
       mapRva({ bytes, sections, rva, size, scope }),
-    rvaAvailableBytes: (rva, scope) =>
-      resolveRva({ bytes, sections, rva, size: 1, scope }).available,
+    rvaFileRange: (rva, scope) =>
+      resolveRva({ bytes, sections, rva, size: 1, scope }),
   };
 };

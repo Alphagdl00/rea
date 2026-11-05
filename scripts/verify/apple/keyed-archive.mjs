@@ -1,5 +1,5 @@
-import { execFile, spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,8 +9,13 @@ import { createHash } from "node:crypto";
 import {
   artifactCli,
   artifactMcpResult,
+  artifactMcpCall,
   withArtifactMcp,
 } from "../../lib/artifact-e2e.mjs";
+import {
+  assertKeyedArchiveIntegerResult,
+  verifyKeyedArchiveIntegerArchives,
+} from "./keyed-archive-integers.mjs";
 
 if (process.platform !== "darwin")
   throw new Error(
@@ -49,7 +54,7 @@ try {
     });
     assert.deepEqual(page.objects, [graph.objects[1]]);
     assert.equal(page.next_offset, 2);
-    const invalid = await client.callTool({
+    const invalid = await artifactMcpCall(client, {
       name: "inspect_keyed_archive",
       arguments: { path: "../other.plist" },
     });
@@ -170,26 +175,37 @@ try {
       );
     });
   }
-  const numericTests = spawnSync(
-    "npm",
-    [
-      "run",
-      "test:focused",
-      "--",
-      "tests/boundary/filesystem/keyedArchiveNativeIntegers.test.ts",
-    ],
-    {
-      cwd: fileURLToPath(new URL("../../../", import.meta.url)),
-      stdio: "inherit",
-      timeout: 240_000,
-    },
-  );
-  if (numericTests.error) throw numericTests.error;
-  assert.equal(
-    numericTests.status,
-    0,
-    "Native Foundation integer cases failed",
-  );
+  const integers = join(root, "integers");
+  await mkdir(integers);
+  await promisify(execFile)("/usr/bin/xcrun", [
+    "swift",
+    "-module-cache-path",
+    join(root, "modules"),
+    fileURLToPath(
+      new URL(
+        "../../../tests/conformance/native/keyed-archive-integers.swift",
+        import.meta.url,
+      ),
+    ),
+    integers,
+  ]);
+  for (const fixture of await verifyKeyedArchiveIntegerArchives(integers)) {
+    const cliResult = assertKeyedArchiveIntegerResult(
+      await artifactCli("inspect-keyed-archive", fixture.archivePath),
+      fixture.format,
+      fixture.digest,
+      fixture.archive,
+    );
+    await withArtifactMcp(fixture.archivePath, async (client) => {
+      const mcpResult = assertKeyedArchiveIntegerResult(
+        await artifactMcpResult(client, "inspect_keyed_archive"),
+        fixture.format,
+        fixture.digest,
+        fixture.archive,
+      );
+      assert.deepEqual(mcpResult, cliResult);
+    });
+  }
   report = {
     ok: true,
     mocked: false,
@@ -197,6 +213,9 @@ try {
     stdio_mcp: true,
     xml_golden: true,
     uid_named_root: true,
+    numeric_formats: ["xml", "binary"],
+    numeric_cli: true,
+    numeric_stdio_mcp: true,
     format: graph.archive_format,
     objects: graph.total_objects,
     references: graph.total_references,

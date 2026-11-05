@@ -3,6 +3,7 @@ import * as t from "@babel/types";
 import type {
   ElectronIpcDescriptor,
   ElectronIpcFinding,
+  ElectronIpcReceiver,
   ElectronSenderValidationFinding,
 } from "./electronStaticAnalysisTypes.js";
 import {
@@ -37,7 +38,10 @@ const inspectIpcCall = (
   node: t.CallExpression | t.OptionalCallExpression,
   context: JavaScriptFindingContext,
 ): void => {
-  const descriptor = ipcDescriptor(electronCalleePath(node.callee, context));
+  const scoped = scopedIpcDescriptor(node, context);
+  const descriptor =
+    scoped?.descriptor ??
+    ipcDescriptor(electronCalleePath(node.callee, context));
   if (descriptor === undefined) return;
   const channelNode = argumentNode(node.arguments[0]);
   const channelValue = electronStaticValue(context.source, channelNode);
@@ -88,6 +92,7 @@ const inspectIpcCall = (
     context.accumulator.unknownFindings += 1;
   const finding: ElectronIpcFinding = {
     ...findingState,
+    ...(scoped === undefined ? {} : { receiver: scoped.receiver }),
     ...channelReference,
     module_key: null,
     location: range(node),
@@ -98,6 +103,48 @@ const inspectIpcCall = (
     node,
     value: finding,
   });
+};
+
+const scopedIpcDescriptor = (
+  node: t.CallExpression | t.OptionalCallExpression,
+  context: JavaScriptFindingContext,
+):
+  | {
+      readonly descriptor: ElectronIpcDescriptor;
+      readonly receiver: ElectronIpcReceiver;
+    }
+  | undefined => {
+  if (
+    !t.isMemberExpression(node.callee) &&
+    !t.isOptionalMemberExpression(node.callee)
+  )
+    return undefined;
+  const operation = semanticStaticPropertyName(
+    node.callee.property,
+    node.callee.computed,
+  );
+  const descriptor = ipcDescriptor(["ipcMain", operation]);
+  if (descriptor === undefined) return undefined;
+  const receiver = context.browserWindowReceiver?.(node.callee.object, node, [
+    operation,
+  ]);
+  if (receiver === undefined) return undefined;
+  const path = receiver.path;
+  const kind =
+    path.length === 3 && path[0] === "webContents" && path[1] === "ipc"
+      ? "web-contents"
+      : path.length === 4 &&
+          path[0] === "webContents" &&
+          path[1] === "mainFrame" &&
+          path[2] === "ipc"
+        ? "main-frame"
+        : undefined;
+  return kind === undefined
+    ? undefined
+    : {
+        descriptor,
+        receiver: { kind, owner_location: range(receiver.owner) },
+      };
 };
 
 const inspectValidationComparison = (
@@ -175,7 +222,7 @@ const addValidation = (
   });
 };
 
-const ipcDescriptor = (
+export const ipcDescriptor = (
   path: readonly string[] | undefined,
 ): ElectronIpcDescriptor | undefined => {
   if (path?.length !== 2) return undefined;
@@ -201,6 +248,7 @@ const ipcDescriptor = (
           operation: "send-to-host",
           mode: "send",
         };
+      case "addListener":
       case "on":
         return { side: "renderer", operation: "on", mode: "listen" };
       case "once":
@@ -209,6 +257,7 @@ const ipcDescriptor = (
   }
   const main = object === "ipcMain" ? operation : undefined;
   switch (main) {
+    case "addListener":
     case "on":
       return { side: "main", operation: "on", mode: "listen" };
     case "once":
