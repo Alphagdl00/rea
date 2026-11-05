@@ -154,7 +154,7 @@ def classify_seniority(title: Any) -> str:
     if any(x in t for x in ("intern", "internship", "trainee", "becario", "practicante")):
         return "IC"
     if any(x in t for x in (
-        "chief financial officer", " cfo", "cfo ", "vice president", "vp finance", "vp, finance",
+        "chief financial officer", "cfo", "vice president", "vp finance", "vp, finance",
         "head of finance", "finance director", "director of finance", "financial director",
         "director finance", "director, finance", "director financiero", "direccion de administracion y finanzas",
     )):
