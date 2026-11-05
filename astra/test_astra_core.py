@@ -6,6 +6,7 @@ from astra_core import (
     astra_score,
     compensation_fit,
     monthly_salary_mxn,
+    _linkedin_salary_from_text,
     city_bucket,
     classify_seniority,
     company_is_target,
@@ -63,6 +64,23 @@ class AstraRankingTests(unittest.TestCase):
             "salary": "",
         }
         self.assertGreater(astra_score(executive, targets)[0], astra_score(analyst, targets)[0])
+
+
+class AstraLinkedInSalaryTests(unittest.TestCase):
+    def test_monthly_linkedin_compensation(self):
+        hit = _linkedin_salary_from_text("$70,000.00/mo")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["min_amount"], 70000)
+        self.assertEqual(hit["max_amount"], 70000)
+        self.assertEqual(hit["interval"], "mensual")
+
+    def test_annual_linkedin_compensation_range(self):
+        hit = _linkedin_salary_from_text("MXN $1,800,000 - $2,400,000/yr")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["currency"], "MXN")
+        self.assertEqual(hit["min_amount"], 1800000)
+        self.assertEqual(hit["max_amount"], 2400000)
+        self.assertEqual(hit["interval"], "anual")
 
 
 class AstraCompensationFitTests(unittest.TestCase):

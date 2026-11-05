@@ -1,4 +1,4 @@
-# Astra Finance Radar v3.2
+# Astra Finance Radar v3.3
 
 Radar local de vacantes financieras para **todo México** o para Guadalajara, Monterrey y CDMX, centrado en publicaciones de las últimas **24 o 48 horas**.
 
@@ -143,3 +143,29 @@ La tabla muestra:
 - `MXN/mes`: midpoint normalizado de la compensación publicada.
 - `Fit compensación`: comparación contra el piso configurado.
 - `Δ Score`: ajuste aplicado al Score Astra.
+
+
+## LinkedIn priority enrichment v3.3
+
+LinkedIn search cards normally provide title, company, location and date, but not always compensation or description. Astra now enriches a **small priority subset**:
+
+- Only roles classified as Executive, Senior or Manager.
+- Only roles that still have no detected salary after deduplication.
+- Maximum 8 LinkedIn job detail pages per run by default.
+- Executive roles are enriched before Senior/Manager roles.
+- 3-second delay between detail requests.
+- The enrichment stops immediately on HTTP 429.
+
+No LinkedIn account, cookies or authenticated session are used.
+
+When a public detail page exposes a compensation block or an explicit salary range in the description, Astra records it as `LinkedIn detalle` and recalculates Compensation Fit. This is specifically intended to catch cases where a title such as CFO looks attractive but the published compensation is below the configured floor.
+
+Settings live in `config.json`:
+
+```json
+{
+  "linkedin_priority_enrichment": true,
+  "linkedin_enrichment_max_jobs": 8,
+  "linkedin_enrichment_delay_seconds": 3.0
+}
+```
