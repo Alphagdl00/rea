@@ -426,8 +426,14 @@ def search_job_boards(
     errors: list[str] = []
     total = max(1, len(cities) * len(queries))
     n = 0
-    for city in cities:
-        location = {"CDMX": "Mexico City, Mexico", "Guadalajara": "Guadalajara, Jalisco, Mexico", "Monterrey": "Monterrey, Nuevo Leon, Mexico"}.get(city, city)
+    search_cities = ["Todo México"] if "Todo México" in cities else cities
+    for city in search_cities:
+        location = {
+            "CDMX": "Mexico City, Mexico",
+            "Guadalajara": "Guadalajara, Jalisco, Mexico",
+            "Monterrey": "Monterrey, Nuevo Leon, Mexico",
+            "Todo México": "Mexico",
+        }.get(city, city)
         for query in queries:
             n += 1
             if progress:
@@ -450,9 +456,13 @@ def search_job_boards(
                     data = r.to_dict()
                     source = str(data.get("site") or "").lower()
                     posted, date_kind, posted_label = normalize_board_date(data.get("date_posted"))
-                    resolved_city = city_bucket(data.get("location"), city)
-                    if resolved_city != city:
+                    resolved_city = city_bucket(data.get("location"), city if city != "Todo México" else None)
+                    if city != "Todo México" and resolved_city != city:
                         continue
+                    if city == "Todo México" and resolved_city == "Otra" and not is_mexico_location(data.get("location")) and not bool(data.get("is_remote") or False):
+                        continue
+                    if city == "Todo México" and resolved_city == "Otra":
+                        resolved_city = "Remoto México" if bool(data.get("is_remote") or False) else "Otra México"
                     row = _row_base(
                         id=str(data.get("id") or ""), source=source, title=str(data.get("title") or ""),
                         company=str(data.get("company") or ""), location=str(data.get("location") or ""),
@@ -870,8 +880,13 @@ def fetch_ats(
                 continue
             for row in found:
                 row["city"] = city_bucket(row.get("location"))
-                if row["city"] not in cities:
+                nationwide = "Todo México" in cities
+                if not nationwide and row["city"] not in cities:
                     continue
+                if nationwide and row["city"] == "Otra" and not is_mexico_location(row.get("location")) and not row.get("is_remote"):
+                    continue
+                if nationwide and row["city"] == "Otra":
+                    row["city"] = "Remoto México" if row.get("is_remote") else "Otra México"
                 if not is_finance_job(row):
                     continue
                 a = age_hours(row.get("posted_at"))
