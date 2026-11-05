@@ -574,6 +574,94 @@ def _parse_occ_cards(page_html: str) -> list[dict[str, Any]]:
     return cards
 
 
+def _find_jobposting_json(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        t = value.get("@type")
+        if t == "JobPosting" or (isinstance(t, list) and "JobPosting" in t):
+            return value
+        for child in value.values():
+            found = _find_jobposting_json(child)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_jobposting_json(child)
+            if found:
+                return found
+    return None
+
+
+def _enrich_occ_card_detail(card: dict[str, Any], session: requests.Session) -> dict[str, Any]:
+    if card.get("posted_at") is not None and card.get("min_amount") is not None:
+        return card
+    try:
+        response = session.get(card.get("job_url") or "", timeout=25)
+        response.raise_for_status()
+        html = response.text
+        scripts = re.findall(
+            r"<script[^>]+type=['\"]application/ld\+json['\"][^>]*>([\s\S]*?)</script>",
+            html,
+            flags=re.I,
+        )
+        posting = None
+        for raw in scripts:
+            try:
+                posting = _find_jobposting_json(json.loads(html_lib.unescape(raw).strip()))
+            except Exception:
+                posting = None
+            if posting:
+                break
+
+        if posting:
+            if card.get("posted_at") is None and posting.get("datePosted"):
+                dt, kind, label = normalize_board_date(posting.get("datePosted"))
+                card["posted_at"], card["date_kind"], card["posted_label"] = dt, kind, label
+
+            if not card.get("company"):
+                org = posting.get("hiringOrganization") or {}
+                if isinstance(org, dict):
+                    card["company"] = str(org.get("name") or "")
+
+            description = clean_html(posting.get("description") or "")
+            if description:
+                card["description"] = description
+
+            base = posting.get("baseSalary") or {}
+            if isinstance(base, dict):
+                cur = str(base.get("currency") or "MXN")
+                value = base.get("value") or {}
+                if isinstance(value, dict):
+                    lo = value.get("minValue") or value.get("value")
+                    hi = value.get("maxValue") or value.get("value")
+                    try:
+                        if lo is not None:
+                            card["min_amount"] = float(lo)
+                        if hi is not None:
+                            card["max_amount"] = float(hi)
+                        card["currency"] = cur
+                        unit = _ascii(value.get("unitText"))
+                        card["interval"] = "mensual" if "month" in unit else ("anual" if "year" in unit else ("hora" if "hour" in unit else ""))
+                    except (TypeError, ValueError):
+                        pass
+
+        if card.get("min_amount") is None:
+            detail_text = clean_html(html)
+            hit = extract_salary_from_text(card.get("description") or detail_text, strict=False)
+            if hit:
+                card.update({k: hit[k] for k in ("min_amount", "max_amount", "currency", "interval")})
+                card["salary_raw"] = hit["raw"]
+
+        if card.get("posted_at") is None:
+            detail_text = clean_html(html)
+            date_match = re.search(r"\b(Hoy|Ayer|Hace\s+\d+\s+(?:horas?|d[ií]as?))\b", detail_text, flags=re.I)
+            if date_match:
+                dt, kind, label = _occ_posted(date_match.group(1))
+                card["posted_at"], card["date_kind"], card["posted_label"] = dt, kind, label
+    except Exception:
+        pass
+    return card
+
+
 def search_occ(
     cities: list[str], hours_old: int, queries: list[str], max_pages: int = 2,
     progress: Callable[[str], None] | None = None,
@@ -630,13 +718,16 @@ def search_occ(
                         if scope_name == "Todo México" and resolved_city == "Otra" and not is_mexico_location(card.get("location")):
                             continue
 
+                        if is_finance_job({"title": card.get("title"), "job_function": "", "description": ""}):
+                            card = _enrich_occ_card_detail(card, session)
+
                         row = _row_base(
                             id=f"occ-{card['id']}", source="occ", title=card.get("title") or "",
                             company=card.get("company") or "?", location=card.get("location") or "",
                             city=resolved_city if resolved_city != "Otra" else "Otra México",
                             posted_at=card.get("posted_at"), date_kind=card.get("date_kind") or "unknown",
                             posted_label=card.get("posted_label") or "", job_url=card.get("job_url") or "",
-                            direct_url=card.get("job_url") or "", description="",
+                            direct_url=card.get("job_url") or "", description=card.get("description") or "",
                             min_amount=card.get("min_amount"), max_amount=card.get("max_amount"),
                             currency=card.get("currency") or "", interval=card.get("interval") or "",
                             salary_source="OCC" if card.get("min_amount") is not None else "",
