@@ -562,7 +562,8 @@ def fetch_smartrecruiters(company: str, board: str, max_results: int = 500) -> l
                 id=posting_id, source="smartrecruiters", title=j.get("name") or "", company=company,
                 location=location, posted_at=parse_dt(j.get("releasedDate")), date_kind="published_at",
                 posted_label=str(j.get("releasedDate") or ""), job_url=posting_url, direct_url=posting_url,
-                description="", job_type=(j.get("typeOfEmployment") or {}).get("label") or "",
+                description="", detail_api=f"https://api.smartrecruiters.com/v1/companies/{board.strip('/')}/postings/{posting_id}",
+                job_type=(j.get("typeOfEmployment") or {}).get("label") or "",
                 job_level=(j.get("experienceLevel") or {}).get("label") or "",
                 job_function=(j.get("function") or {}).get("label") or "",
             ))
@@ -627,17 +628,52 @@ def fetch_workday(company: str, board: str, max_results: int = 250) -> list[dict
             ext = j.get("externalPath") or ""
             direct = public_base.rstrip("/") + (ext if ext.startswith("/") else "/" + ext)
             label = j.get("postedOn") or ""
+            detail_api = endpoint.rsplit("/jobs", 1)[0] + ext
             out.append(_row_base(
                 id=str(j.get("bulletFields", [""])[0] if j.get("bulletFields") else ext), source="workday",
                 title=j.get("title") or "", company=company, location=j.get("locationsText") or "",
                 posted_at=_parse_workday_posted(label), date_kind="relative_posted", posted_label=label,
-                job_url=direct, direct_url=direct, description="",
+                job_url=direct, direct_url=direct, description="", detail_api=detail_api,
             ))
         offset += len(posts)
         total = int(data.get("total") or 0)
         if not posts or len(posts) < limit or (total > 0 and offset >= total):
             break
     return out
+
+
+def enrich_ats_detail(row: dict[str, Any]) -> dict[str, Any]:
+    detail_api = row.get("detail_api")
+    if not detail_api or row.get("description"):
+        return apply_salary_extraction(row)
+    try:
+        data = _requests_session().get(str(detail_api), timeout=25).json()
+        source = row.get("source")
+        description = ""
+        if source == "workday":
+            info = data.get("jobPostingInfo") or {}
+            description = clean_html(
+                info.get("jobDescription")
+                or info.get("description")
+                or data.get("jobDescription")
+                or ""
+            )
+        elif source == "smartrecruiters":
+            sections = ((data.get("jobAd") or {}).get("sections") or {})
+            parts = []
+            if isinstance(sections, dict):
+                for section in sections.values():
+                    if isinstance(section, dict):
+                        parts.append(str(section.get("text") or section.get("description") or ""))
+                    elif section:
+                        parts.append(str(section))
+            description = clean_html(" ".join(parts))
+        if description:
+            row["description"] = description
+    except Exception:
+        # Detail enrichment must never discard an otherwise valid posting.
+        pass
+    return apply_salary_extraction(row)
 
 
 def fetch_ats(
@@ -671,7 +707,7 @@ def fetch_ats(
                 if a is None:
                     continue
                 if a <= hours_old + 1:
-                    rows.append(row)
+                    rows.append(enrich_ats_detail(row))
         except Exception as exc:
             errors.append(f"{company} ({ats}): {exc}")
     return rows, errors
