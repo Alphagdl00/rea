@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
-USER_AGENT = "AstraFinanceRadar/3.1 (+local job-search tool)"
+USER_AGENT = "AstraFinanceRadar/3.2 (+local job-search tool)"
 MX_TZ = ZoneInfo("America/Mexico_City")
 FINANCE_TITLE_TERMS = (
     "finance", "financial", "fp&a", "fp & a", "financial planning", "controller",
@@ -280,6 +280,72 @@ def astra_score(row: dict[str, Any], targets: set[str]) -> tuple[int, str]:
         score -= 18; reasons.append("nivel junior")
 
     return max(0, min(100, int(score))), " · ".join(reasons)
+
+
+def monthly_salary_mxn(row: dict[str, Any]) -> float | None:
+    if _ascii(row.get("currency")) not in {"mxn", "mex", "peso", "pesos", ""}:
+        return None
+    lo = row.get("min_amount")
+    hi = row.get("max_amount")
+    try:
+        if pd.isna(lo): lo = None
+        if pd.isna(hi): hi = None
+    except Exception:
+        pass
+    values = [float(x) for x in (lo, hi) if x is not None]
+    if not values:
+        return None
+    midpoint = sum(values) / len(values)
+    interval = _ascii(row.get("interval"))
+    if interval in {"anual", "annual", "yearly", "year"}:
+        return midpoint / 12.0
+    if interval in {"mensual", "monthly", "month", "mes"}:
+        return midpoint
+    return None
+
+
+def compensation_fit(
+    row: dict[str, Any],
+    floors: dict[str, float] | None = None,
+) -> tuple[int, str, float | None, float | None]:
+    floors = floors or {"Executive": 140000.0, "Senior": 110000.0, "Manager": 90000.0}
+    seniority = str(row.get("seniority") or classify_seniority(row.get("title")))
+    floor = float(floors.get(seniority) or 0)
+    monthly = monthly_salary_mxn(row)
+    if floor <= 0 or monthly is None:
+        return 0, "Sin ajuste", monthly, floor if floor > 0 else None
+
+    ratio = monthly / floor
+    if ratio < 0.50:
+        return -40, f"Muy bajo ({ratio:.0%} del piso)", monthly, floor
+    if ratio < 0.70:
+        return -30, f"Alto descuento ({ratio:.0%} del piso)", monthly, floor
+    if ratio < 0.85:
+        return -20, f"Bajo ({ratio:.0%} del piso)", monthly, floor
+    if ratio < 1.00:
+        return -10, f"Debajo del piso ({ratio:.0%})", monthly, floor
+    if ratio < 1.25:
+        return 3, f"Cumple piso ({ratio:.0%})", monthly, floor
+    return 6, f"Sobre piso ({ratio:.0%})", monthly, floor
+
+
+def apply_compensation_fit(
+    rows: list[dict[str, Any]],
+    floors: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    for row in rows:
+        base_score = int(row.get("astra_score") or 0)
+        adjustment, label, monthly, floor = compensation_fit(row, floors)
+        row["score_base"] = base_score
+        row["comp_adjustment"] = adjustment
+        row["comp_fit"] = label
+        row["salary_monthly_mxn"] = monthly
+        row["comp_floor_mxn"] = floor
+        row["astra_score"] = max(0, min(100, base_score + adjustment))
+        if adjustment:
+            row["score_reason"] = (str(row.get("score_reason") or "") + f" · comp {adjustment:+d}").strip(" ·")
+    rows.sort(key=lambda r: (-int(r.get("astra_score") or 0), r.get("sort_age", 999999), str(r.get("company"))))
+    return rows
 
 
 def salary_text(row: dict[str, Any]) -> str:
@@ -1090,7 +1156,8 @@ def upsert_jobs(path: str | Path, rows: list[dict[str, Any]]) -> None:
 
 def run_search(config: dict[str, Any], cities: list[str], hours_old: int, sources: list[str], results_wanted: int,
                ats_csv: str | Path, progress: Callable[[str], None] | None = None,
-               target_companies_path: str | Path | None = None) -> tuple[list[dict[str, Any]], list[str]]:
+               target_companies_path: str | Path | None = None,
+               compensation_floors: dict[str, float] | None = None) -> tuple[list[dict[str, Any]], list[str]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
     board_sites = [s for s in sources if s in {"linkedin", "indeed", "glassdoor"}]
@@ -1104,4 +1171,5 @@ def run_search(config: dict[str, Any], cities: list[str], hours_old: int, source
         r, e = search_occ(cities, hours_old, config.get("occ_queries", ["finanzas", "finance", "controller", "gerente de finanzas"]), int(config.get("occ_max_pages", 2)), progress)
         rows.extend(r); errors.extend(e)
     merged = merge_dedupe(rows)
-    return enrich_ranking(merged, target_companies_path), list(dict.fromkeys(errors))
+    ranked = enrich_ranking(merged, target_companies_path)
+    return apply_compensation_fit(ranked, compensation_floors), list(dict.fromkeys(errors))
