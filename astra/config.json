@@ -11,6 +11,13 @@
     "gerente de finanzas"
   ],
   "occ_max_pages": 2,
-  "default_cities": ["Guadalajara", "Monterrey", "CDMX"],
-  "default_hours": 48
+  "default_cities": [
+    "Guadalajara",
+    "Monterrey",
+    "CDMX"
+  ],
+  "default_hours": 48,
+  "linkedin_priority_enrichment": true,
+  "linkedin_enrichment_max_jobs": 8,
+  "linkedin_enrichment_delay_seconds": 3
 }
