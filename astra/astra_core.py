@@ -907,41 +907,58 @@ def enrich_linkedin_priority_details(
 
         job_id = m.group(1)
         try:
-            details = scraper._fetch_details(job_id)
-            if scraper.error and ("429" in scraper.error or "blocked" in scraper.error.lower()):
-                errors.append("LinkedIn detalle: 429/bloqueo; enrichment detenido")
-                break
+            from bs4 import BeautifulSoup
+            from urllib.parse import urlparse as _urlparse
 
-            description = clean_html(details.get("description") or "")
+            response = scraper.session.get(f"https://www.linkedin.com/jobs/view/{job_id}", timeout=25)
+            if response.status_code in (403, 429):
+                errors.append(f"LinkedIn detalle: HTTP {response.status_code}; enrichment detenido")
+                break
+            if response.status_code != 200:
+                errors.append(f"LinkedIn detalle {job_id}: HTTP {response.status_code}")
+                continue
+
+            path = _urlparse(response.url).path
+            if not path.startswith("/jobs/view/"):
+                errors.append(f"LinkedIn detalle {job_id}: redirección a {path}")
+                continue
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            desc_tag = soup.find("div", class_="show-more-less-html__markup")
+            description = clean_html(desc_tag.get_text(" ", strip=True) if desc_tag else "")
             if description:
                 row["description"] = description
 
-            lo = details.get("min_amount")
-            hi = details.get("max_amount")
-            currency = details.get("currency")
-            interval = details.get("interval")
-            if hasattr(interval, "value"):
-                interval = interval.value
+            salary_tag = soup.find("div", class_="compensation__salary")
+            salary_raw = clean_html(salary_tag.get_text(" ", strip=True) if salary_tag else "")
+            hit = None
 
-            if lo is not None or hi is not None:
-                row["min_amount"] = lo
-                row["max_amount"] = hi
-                row["currency"] = str(currency or "")
-                row["interval"] = str(interval or "")
-                row["salary"] = salary_text(row)
-                row["salary_source"] = "LinkedIn detalle"
-                salary_hits += 1
-            elif description:
-                hit = extract_salary_from_text(description, strict=True)
-                if not hit:
-                    # High-priority role fallback: require an explicit pay period near the amount.
-                    hit = _linkedin_salary_from_text(description)
-                if hit:
-                    row.update({k: hit[k] for k in ("min_amount", "max_amount", "currency", "interval")})
+            if salary_raw:
+                pay = scraper._parse_salary(salary_raw)
+                if pay.min_amount is not None or pay.max_amount is not None:
+                    interval = pay.interval.value if getattr(pay.interval, "value", None) else ""
+                    row["min_amount"] = pay.min_amount
+                    row["max_amount"] = pay.max_amount
+                    row["currency"] = str(pay.currency or "")
+                    row["interval"] = str(interval)
                     row["salary"] = salary_text(row)
-                    row["salary_source"] = "LinkedIn descripción"
-                    row["salary_raw"] = hit["raw"]
+                    row["salary_source"] = "LinkedIn detalle"
+                    row["salary_raw"] = salary_raw
                     salary_hits += 1
+                else:
+                    hit = _linkedin_salary_from_text(salary_raw)
+
+            if not row.get("salary") and description:
+                hit = hit or extract_salary_from_text(description, strict=True)
+                if not hit:
+                    hit = _linkedin_salary_from_text(description)
+
+            if hit and not row.get("salary"):
+                row.update({k: hit[k] for k in ("min_amount", "max_amount", "currency", "interval")})
+                row["salary"] = salary_text(row)
+                row["salary_source"] = "LinkedIn descripción"
+                row["salary_raw"] = hit["raw"]
+                salary_hits += 1
 
             if description or row.get("salary"):
                 enriched += 1
